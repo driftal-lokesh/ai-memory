@@ -99,7 +99,8 @@ snapshot).
 
 ```powershell
 python memory_backup.py backup     # backup, encrypt, upload, prune
-python memory_backup.py verify     # restore newest into a temp dir and assert it's real
+python memory_backup.py verify     # decrypt newest and check its contents (safe while the server runs)
+python memory_backup.py verify --deep   # real restore into a temp dir (Stop-Service ai-memory first)
 python memory_backup.py prune      # enforce retention only
 python memory_backup.py restore    # DANGER: overwrites live data. Stop-Service ai-memory first.
 python test_backup.py              # crypto self-check
@@ -126,6 +127,8 @@ Start-Service ai-memory
 | Service won't start | `%LOCALAPPDATA%\ai-memory\logs\ai-memory.err.log` |
 | Lap B can't connect | Is the WireGuard tunnel active on Lap B? Is UDP 51820 forwarded? Did your home IP change — check `Endpoint` in `lap-b.conf` |
 | `401` with a token | Key was revoked or truncated. `ai-memory api-key add --username <you> --label lap-b` |
+| Backup fails with `401 auth required` | `backup` is a server call (`POST /admin/backup`), not a disk operation. It needs `AI_MEMORY_AUTH_TOKEN` — setup exports it, and also writes `%LOCALAPPDATA%\ai-memory\.root-token`. |
+| `restore` refuses to run | Another ai-memory process is alive. `Stop-Service ai-memory` first. |
 | Lap A rebooted, server gone | It shouldn't. `Get-Service ai-memory`. Never start the server from a Scheduled Task — it is silently killed at the next reboot. |
 | `winget` not found | Install "App Installer" from the Microsoft Store |
 | The window vanished | It shouldn't any more, but the full transcript is at `%TEMP%\ai-memory-setup-*.log` |

@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import io
 import os
-import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 from pathlib import Path
 
@@ -69,11 +70,36 @@ def passphrase_or_die() -> str:
     return p
 
 
-def run(cmd: list[str]) -> None:
+def auth_token(data_dir: str) -> str | None:
+    """The root bearer token.
+
+    `ai-memory backup` is not a disk operation -- it POSTs /admin/backup to the
+    running server, which returns 401 without this. setup.ps1 exports it and
+    also drops it in the data dir; env wins.
+    """
+    tok = os.environ.get("AI_MEMORY_AUTH_TOKEN")
+    if tok:
+        return tok.strip()
+    f = Path(data_dir) / ".root-token"
+    if f.is_file():
+        return f.read_text().strip() or None
+    return None
+
+
+def run(cmd: list[str], data_dir: str | None = None) -> None:
     print("  $", " ".join(cmd))
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    env = os.environ.copy()
+    if data_dir:
+        tok = auth_token(data_dir)
+        if tok:
+            env["AI_MEMORY_AUTH_TOKEN"] = tok
+    r = subprocess.run(cmd, capture_output=True, text=True, env=env)
     if r.returncode != 0:
-        sys.exit(f"command failed ({r.returncode}):\n{r.stdout}\n{r.stderr}")
+        hint = ""
+        if "401" in (r.stdout + r.stderr) or "auth required" in (r.stdout + r.stderr):
+            hint = ("\n\nThe server rejected the request. Set AI_MEMORY_AUTH_TOKEN, or make sure "
+                    f"{Path(data_dir or '.') / '.root-token'} exists and holds the root token.")
+        sys.exit(f"command failed ({r.returncode}):\n{r.stdout}\n{r.stderr}{hint}")
 
 
 def stamp() -> str:
@@ -94,7 +120,7 @@ def cmd_backup(a) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         raw = Path(tmp) / f"ai-memory-{stamp()}.tar.gz"
         print(f"[1/4] hot backup -> {raw.name}")
-        run([a.exe, "--data-dir", a.data_dir, "backup", "--to", str(raw)])
+        run([a.exe, "--data-dir", a.data_dir, "backup", "--to", str(raw)], a.data_dir)
 
         print(f"[2/4] encrypt ({raw.stat().st_size / 1e6:.1f} MB)")
         blob = encrypt(raw.read_bytes(), pw)
@@ -131,37 +157,62 @@ def cmd_restore(a) -> None:
         tar.write_bytes(plain)
         print(f"[2/2] restore -> {a.data_dir}")
         print("      NOTE: ai-memory refuses if the server is still running.")
-        run([a.exe, "restore", "--from", str(tar), "--data-dir", a.data_dir, "--force"])
+        run([a.exe, "restore", "--from", str(tar), "--data-dir", a.data_dir, "--force"], a.data_dir)
     print("OK restored")
 
 
-def cmd_verify(a) -> None:
-    """Restore the newest archive into a throwaway dir and assert it has content.
+def inspect_archive(plain: bytes) -> list[str]:
+    """Top-level entries inside the decrypted tarball."""
+    if plain[:2] != b"\x1f\x8b":
+        raise ValueError("decrypted payload is not gzip -- this is not an ai-memory backup")
+    with tarfile.open(fileobj=io.BytesIO(plain), mode="r:gz") as tf:
+        names = tf.getnames()
+    if not names:
+        raise ValueError("archive is empty")
+    tops = sorted({n.split("/")[0] for n in names if n and n != "."})
+    return tops
 
-    A backup that has never been restored is an assumption, not a backup.
+
+def cmd_verify(a) -> None:
+    """Prove the newest archive is decryptable and structurally an ai-memory backup.
+
+    Deliberately does NOT call `ai-memory restore`: restore refuses to run while
+    an ai-memory process is alive, and on this setup the server never stops.
+    Decrypting and reading the tar index proves the passphrase works, the
+    ciphertext is intact, and the payload is the real thing -- which is what
+    actually goes wrong. Use --deep for a true restore (stop the service first).
     """
     pw = passphrase_or_die()
     found = archives(Path(a.dest))
     if not found:
         sys.exit("FAIL: no archives to verify")
     src = found[-1]
-    print(f"verifying {src.name}")
+    print(f"verifying {src.name} ({src.stat().st_size / 1e6:.1f} MB)")
 
-    plain = decrypt(src.read_bytes(), pw)          # raises if passphrase wrong or tampered
-    assert plain[:2] == b"\x1f\x8b", "decrypted payload is not gzip -- archive is not an ai-memory backup"
+    plain = decrypt(src.read_bytes(), pw)   # raises on wrong passphrase or tampering
+    tops = inspect_archive(plain)
+    print(f"  decrypts, and contains: {', '.join(tops)}")
 
+    expected = {"wiki", "db", "config.toml"}
+    if not (expected & set(tops)):
+        sys.exit(f"FAIL: archive has none of {sorted(expected)} at top level -- got {tops}")
+
+    if not a.deep:
+        print("OK archive is intact and readable")
+        return
+
+    print("  --deep: restoring into a temp dir (requires the service stopped)")
     with tempfile.TemporaryDirectory() as tmp:
         tar = Path(tmp) / "v.tar.gz"
         tar.write_bytes(plain)
         target = Path(tmp) / "data"
         target.mkdir()
-        run([a.exe, "restore", "--from", str(tar), "--data-dir", str(target), "--force"])
+        run([a.exe, "restore", "--from", str(tar), "--data-dir", str(target), "--force"], a.data_dir)
         wiki = target / "wiki"
-        assert wiki.is_dir(), f"FAIL: no wiki/ in restored tree ({list(target.iterdir())})"
-        pages = list(wiki.rglob("*.md"))
-        print(f"  wiki/ restored with {len(pages)} markdown page(s)")
-        shutil.rmtree(target, ignore_errors=True)
-    print("OK backup is restorable")
+        if not wiki.is_dir():
+            sys.exit(f"FAIL: no wiki/ in restored tree ({[p.name for p in target.iterdir()]})")
+        print(f"  wiki/ restored with {len(list(wiki.rglob('*.md')))} markdown page(s)")
+    print("OK backup is fully restorable")
 
 
 # ---------------------------------------------------------------- cli
@@ -180,7 +231,10 @@ def main() -> None:
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("backup").set_defaults(fn=cmd_backup)
     sub.add_parser("prune").set_defaults(fn=cmd_prune)
-    sub.add_parser("verify").set_defaults(fn=cmd_verify)
+    v = sub.add_parser("verify")
+    v.add_argument("--deep", action="store_true",
+                   help="also run a real ai-memory restore into a temp dir (stop the service first)")
+    v.set_defaults(fn=cmd_verify)
     r = sub.add_parser("restore")
     r.add_argument("--src", help="specific .enc file (default: newest in --dest)")
     r.set_defaults(fn=cmd_restore)

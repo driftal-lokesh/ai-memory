@@ -496,7 +496,15 @@ function Step4-Service {
     else {
         $u = Aim @('user', 'add-human', '--username', $UserName, '--email', "$UserName@local", '--name', $UserName) `
             -EnvVars @{ AI_MEMORY_AUTH_TOKEN = $root } -AllowFail
-        if ($u -match 'password') { Note "Web UI login for '$UserName' -- temp password from setup:`n$($u.Trim())" }
+        if ($u -match 'password') {
+            # the raw output carries ai-memory's stderr banner and PowerShell's
+            # NativeCommandError decoration; keep only the credential
+            $pw = ($u -split "`n" |
+                Where-Object { $_.Trim() -match '^[A-Za-z0-9+/_=-]{16,}$' } |
+                Select-Object -Last 1)
+            if ($pw) { Note "Web UI login -- user '$UserName', temporary password: $($pw.Trim())`n     Change it on first login at http://127.0.0.1:$Port" }
+            else { Note "Web UI user '$UserName' created; its temporary password is in $LogFile" }
+        }
 
         $keys = @{}
         foreach ($label in @('lap-a', 'lap-b')) {
@@ -537,6 +545,10 @@ function Step4b-Backups {
     }
     $env:AI_MEMORY_BACKUP_PASSPHRASE = $pass
 
+    # backup is a server call, not a disk operation -- without this the daily
+    # task gets 401 auth required from POST /admin/backup
+    [Environment]::SetEnvironmentVariable('AI_MEMORY_AUTH_TOKEN', $script:RootToken, 'User')
+    $env:AI_MEMORY_AUTH_TOKEN = $script:RootToken
     [Environment]::SetEnvironmentVariable('AI_MEMORY_BACKUP_DEST', $script:BackupDest, 'User')
     [Environment]::SetEnvironmentVariable('AI_MEMORY_DATA_DIR', $DataDir, 'User')
     [Environment]::SetEnvironmentVariable('AI_MEMORY_EXE', $Exe, 'User')
@@ -603,6 +615,8 @@ function Step5-Test {
         try {
             $b = Native { & $script:Python memory_backup.py --dest "$($script:BackupDest)" --keep $KeepBackups backup }
             if ($script:NativeExit -ne 0) { Warn "backup output:`n$b"; return $false }
+            # plain verify (no --deep): restore refuses to run while the
+            # service is alive, and the service is now permanent
             $v = Native { & $script:Python memory_backup.py --dest "$($script:BackupDest)" verify }
             if ($script:NativeExit -ne 0) { Warn "verify output:`n$v" }
             $script:NativeExit -eq 0
