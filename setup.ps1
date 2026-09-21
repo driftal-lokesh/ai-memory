@@ -189,11 +189,51 @@ function Get-PortHolder {
 
 function Wait-PortFree {
     for ($i = 0; $i -lt 20; $i++) {
-        if (-not (Get-PortHolder)) { return $true }
+        if (-not (Get-PortHolder)) { return }
         Start-Sleep 1
     }
     Warn "port $Port is still held by $(Get-PortHolder)"
-    return $false
+}
+
+# Runs the server's own command line in the foreground for a few seconds and
+# reports what it printed. If it runs fine here, the binary and config are good
+# and the fault is in the service wrapper or its account -- which is a different
+# fix. This is the only check that answers "why" directly.
+function Test-ServeDirectly {
+    $o = Join-Path $env:TEMP 'aim-probe-out.txt'
+    $e = Join-Path $env:TEMP 'aim-probe-err.txt'
+    Remove-Item $o, $e -ErrorAction SilentlyContinue
+
+    $env:AI_MEMORY_AUTH_TOKEN = $script:RootToken
+    $serveArgs = "--data-dir `"$DataDir`" serve --transport http --bind $($script:BindIp):$Port --enable-web"
+    Say ""
+    Write-Host "  ---- running the server directly for 6s ----" -ForegroundColor Yellow
+    Say "  $Exe $serveArgs"
+    Say ""
+    try {
+        $proc = Start-Process -FilePath $Exe -ArgumentList $serveArgs -NoNewWindow -PassThru `
+            -RedirectStandardOutput $o -RedirectStandardError $e
+    }
+    catch { Warn "could not even launch it: $($_.Exception.Message)"; return }
+
+    Start-Sleep 6
+    $alive = -not $proc.HasExited
+    if ($alive) { try { $proc.Kill() } catch { } }
+
+    foreach ($f in @($e, $o)) {
+        if ((Test-Path $f) -and (Get-Item $f).Length -gt 0) {
+            Get-Content $f -Tail 20 | ForEach-Object { Say "  $_" }
+        }
+    }
+    Say ""
+    if ($alive) {
+        Write-Host "  The server itself starts fine. The fault is the service wrapper," -ForegroundColor Yellow
+        Write-Host "  not ai-memory or your config." -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "  The server exited on its own (code $($proc.ExitCode)). The reason is above." -ForegroundColor Yellow
+    }
+    Say ""
 }
 
 # Telling someone to go read a log file is not an error message. Print it.
@@ -477,6 +517,7 @@ function Step4-Service {
 
     # --- WinSW service ---------------------------------------------------
     New-Item -ItemType Directory -Force $SvcDir | Out-Null
+    New-Item -ItemType Directory -Force (Join-Path $DataDir 'logs') | Out-Null
     $winsw = Join-Path $SvcDir 'ai-memory-service.exe'
     if (-not (Test-Path $winsw)) {
         Info 'downloading WinSW'
@@ -509,7 +550,7 @@ function Step4-Service {
 
     $existing = Get-Service 'ai-memory' -ErrorAction SilentlyContinue
     $configChanged = -not (Test-Path $xmlPath) -or
-                     ((Get-Content $xmlPath -Raw) -ne $xml)
+                     ((Get-Content $xmlPath -Raw).Trim() -ne $xml.Trim())
     Set-Content $xmlPath -Value $xml -Encoding UTF8
 
     if ($existing -and -not $configChanged) {
@@ -551,10 +592,33 @@ function Step4-Service {
         Start-Sleep 1
     }
     if (-not $svc -or $svc.Status -ne 'Running') {
-        Show-ServerLogs
+        # one automatic retry: a stale ai-memory.exe squatting on the port is by
+        # far the most common cause and it is trivially recoverable
+        Warn 'service did not come up; clearing stale processes and retrying once'
+        Get-Process 'ai-memory' -ErrorAction SilentlyContinue | ForEach-Object {
+            Say "  stopping stale ai-memory.exe (pid $($_.Id))"
+            try { Stop-Process -Id $_.Id -Force -ErrorAction Stop } catch { }
+        }
+        Wait-PortFree
+        Native { & $winsw start } | Out-Null
+        for ($i = 0; $i -lt 30; $i++) {
+            $svc = Get-Service 'ai-memory' -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -eq 'Running') { break }
+            Start-Sleep 1
+        }
+    }
+
+    if (-not $svc -or $svc.Status -ne 'Running') {
+        $status = if ($svc) { $svc.Status } else { 'not installed' }
+        Say ""
+        Write-Host "  The service is $status. Everything known about why:" -ForegroundColor Yellow
         $held = Get-PortHolder
         if ($held) { Say "  port $Port is held by: $held" }
-        Die "service did not start (status: $(if ($svc) { $svc.Status } else { 'not installed' }))"
+        Show-ServerLogs
+        Native { & $winsw status } | ForEach-Object { Say "  winsw status: $_" }
+        Test-ServeDirectly
+        Say "  service XML: $xmlPath"
+        Die "service did not start (status: $status)"
     }
     Ok 'service running (survives reboot)'
 

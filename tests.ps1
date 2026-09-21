@@ -259,7 +259,34 @@ T 'port contention is reported by name' {
     ($code -match 'function Get-PortHolder') -and ($code -match 'is held by')
 }
 
-# --- 12. MCP URL always carries the mandatory /mcp suffix ----------------
+# --- 12. the second-run regressions ---------------------------------------
+T 'the XML comparison is whitespace-tolerant' {
+    # Set-Content adds a trailing newline the here-string lacks, so a naive
+    # comparison never matched and every run took the reinstall path
+    (Get-Content $src -Raw) -match '\.Trim\(\) -ne \$xml\.Trim\(\)'
+}
+T 'Wait-PortFree does not leak a boolean into the transcript' {
+    $code = Get-Content $src -Raw
+    $fn = [regex]::Match($code, 'function Wait-PortFree \{[\s\S]*?\n\}').Value
+    ($fn -notmatch 'return \$true') -and ($fn -notmatch 'return \$false')
+}
+T 'the log directory is created before WinSW needs it' {
+    (Get-Content $src -Raw) -match "New-Item -ItemType Directory -Force \(Join-Path \`$DataDir 'logs'\)"
+}
+T 'a failed start retries once after clearing stale processes' {
+    (Get-Content $src -Raw) -match 'clearing stale processes and retrying once'
+}
+T 'a failed start runs the server directly to find out why' {
+    $code = Get-Content $src -Raw
+    ($code -match 'function Test-ServeDirectly') -and ($code -match 'Test-ServeDirectly\s')
+}
+T 'no automatic PowerShell variable is assigned to' {
+    $bad = Get-Content $src | Where-Object { $_ -match '\$(args|input|this)\s*=' }
+    if ($bad) { $bad | ForEach-Object { Write-Host "     $_" -ForegroundColor DarkGray } }
+    $bad.Count -eq 0
+}
+
+# --- 13. MCP URL always carries the mandatory /mcp suffix ----------------
 T 'every printed MCP url ends in /mcp' {
     $txt = Get-Content $src -Raw
     $urls = [regex]::Matches($txt, 'http://\$\([^)]+\):\$Port(/mcp)?') | ForEach-Object { $_.Value }
