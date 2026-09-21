@@ -126,7 +126,18 @@ function Native {
     $ErrorActionPreference = 'Continue'
     try {
         $global:LASTEXITCODE = 0
-        $out = & $Block 2>&1 | Out-String
+        # Redirected stderr arrives as ErrorRecord objects, which render with
+        # PowerShell's own decoration -- "At C:\...", "+ ~~~~", "CategoryInfo",
+        # "FullyQualifiedErrorId : NativeCommandError". That is noise in the
+        # transcript, and it also poisons any pattern match on the output: a
+        # check for 'error' matches NativeCommandError and fails a command that
+        # succeeded. Keep the message, drop the decoration.
+        $out = & $Block 2>&1 | ForEach-Object {
+            if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { $_ }
+        } | Out-String
+        # Rust tracing emits ANSI colour codes that a PowerShell host will not
+        # render; they just clutter the log.
+        $out = $out -replace "`e\[[0-9;]*m", '' -replace "$([char]27)\[[0-9;]*m", ''
         $script:NativeExit = $global:LASTEXITCODE
         return $out
     }
@@ -134,6 +145,26 @@ function Native {
         $ErrorActionPreference = $prevEap
         if ($hasNativePref) { $global:PSNativeCommandUseErrorActionPreference = $prevNative }
     }
+}
+
+# Probe a URL and return its HTTP status as an int. 0 means no response at all
+# (refused, DNS, timeout). Never throws: a 401 or 403 is a perfectly good answer
+# here, and letting the call throw fills the transcript with
+# "TerminatingError" lines for checks that actually passed.
+function Get-HttpStatus {
+    param([string] $Url, [string] $Token, [int] $TimeoutSec = 10)
+    $headers = @{}
+    if ($Token) { $headers['Authorization'] = "Bearer $Token" }
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'SilentlyContinue'
+    try {
+        $r = Invoke-WebRequest -UseBasicParsing $Url -TimeoutSec $TimeoutSec -Headers $headers -ErrorAction SilentlyContinue
+        if ($r) { return [int]$r.StatusCode }
+        if ($Error.Count) { return (StatusOf $Error[0]) }
+        return 0
+    }
+    catch { return (StatusOf $_) }
+    finally { $ErrorActionPreference = $prevEap }
 }
 
 # Invoke-WebRequest raises WebException on PowerShell 5.1 and
@@ -258,11 +289,7 @@ function Wait-ServiceHealthy {
 # Any HTTP response means it is listening. 401 is a fine answer here: it proves
 # the server is up and auth is on.
 function Test-ServerAnswers {
-    try {
-        Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$Port/mcp" -TimeoutSec 3 | Out-Null
-        return $true
-    }
-    catch { return ((StatusOf $_) -ne 0) }
+    return ((Get-HttpStatus "http://127.0.0.1:$Port/mcp" -TimeoutSec 3) -ne 0)
 }
 
 # Every Host header a client might send. There is NO wildcard -- from serve.rs:
@@ -317,12 +344,7 @@ function Test-KeysValid ($keyFile) {
     try { $keys = Get-Content $keyFile -Raw | ConvertFrom-Json } catch { return $false }
     $first = @($keys.PSObject.Properties)[0]
     if (-not $first) { return $false }
-    try {
-        Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$Port/handoff" -TimeoutSec 10 `
-            -Headers @{ Authorization = "Bearer $($first.Value)" } | Out-Null
-        return $true
-    }
-    catch { return ((StatusOf $_) -ne 401) }
+    return ((Get-HttpStatus "http://127.0.0.1:$Port/handoff" $first.Value) -ne 401)
 }
 
 # Rewrite just the allowlist env var in the service XML, in place.
@@ -339,13 +361,7 @@ function Set-AllowedHostsInXml ($xmlPath, $value) {
 # does not, rebuild the list and restart once.
 function Assert-HostAllowlist ($xmlPath, $winsw) {
     for ($attempt = 0; $attempt -lt 2; $attempt++) {
-        $code = 0
-        try {
-            $r = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$Port/handoff" -TimeoutSec 10 `
-                -Headers @{ Authorization = "Bearer $($script:RootToken)" }
-            $code = [int]$r.StatusCode
-        }
-        catch { $code = StatusOf $_ }
+        $code = Get-HttpStatus "http://127.0.0.1:$Port/handoff" $script:RootToken
 
         if ($code -ne 403) {
             Ok "Host allowlist accepts requests (got $code)"
@@ -1004,28 +1020,26 @@ function Step5-Test {
         # status talks to the server, so it needs the root credential like any
         # other client; without it the call just 401s
         $o = Aim @('status') -EnvVars @{ AI_MEMORY_AUTH_TOKEN = $script:RootToken } -AllowFail
-        # any output at all used to pass this, including a failure message
-        ($script:NativeExit -eq 0) -and ($o -notmatch 'refused|unreachable|not running|error')
+        # Exit code is the contract. An earlier version also grepped the output
+        # for 'error', which matched PowerShell's own NativeCommandError
+        # decoration and failed a command that had succeeded.
+        if ($script:NativeExit -ne 0) { Warn "  status output:`n$($o.Trim())" }
+        $script:NativeExit -eq 0
     }
 
     Check 'MCP endpoint reachable on loopback' {
-        try { Invoke-WebRequest -UseBasicParsing "$local/mcp" -TimeoutSec 10 | Out-Null; $true }
-        catch { (StatusOf $_) -in 400, 401, 403, 405, 406 }
+        (Get-HttpStatus "$local/mcp") -ne 0
     }
 
     Check 'unauthenticated request is rejected (401)' {
-        try { Invoke-WebRequest -UseBasicParsing "$local/handoff" -TimeoutSec 10 | Out-Null; $false }
-        catch {
-            $c = StatusOf $_
-            # 403 here means the Host allowlist rejected it before auth ran
-            if ($c -eq 403) { Warn '  403 = forbidden host, not an auth result' }
-            $c -eq 401
-        }
+        $c = Get-HttpStatus "$local/handoff"
+        # 403 here means the Host allowlist rejected it before auth ran
+        if ($c -eq 403) { Warn '  403 = forbidden host, not an auth result' }
+        $c -eq 401
     }
 
     Check 'authenticated request is accepted (200)' {
-        (Invoke-WebRequest -UseBasicParsing "$local/handoff" -TimeoutSec 10 `
-                -Headers @{ Authorization = "Bearer $tok" }).StatusCode -eq 200
+        (Get-HttpStatus "$local/handoff" $tok) -eq 200
     }
 
     if ($Reach -eq 'Wireguard') {
@@ -1033,8 +1047,7 @@ function Step5-Test {
             (Get-Service 'WireGuardTunnel$ai-memory-wg0' -ErrorAction Stop).Status -eq 'Running'
         }
         Check "server answers on tunnel address $($script:McpHost)" {
-            try { Invoke-WebRequest -UseBasicParsing "http://$($script:McpHost):$Port/mcp" -TimeoutSec 10 | Out-Null; $true }
-            catch { (StatusOf $_) -in 400, 401, 403, 405, 406 }
+            (Get-HttpStatus "http://$($script:McpHost):$Port/mcp") -ne 0
         }
     }
 

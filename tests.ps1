@@ -302,9 +302,27 @@ T 'readiness requires an HTTP answer, not just service status' {
     ($code -match 'function Wait-ServiceHealthy') -and ($code -match 'function Test-ServerAnswers') -and
     ($code -match 'Test-ServerAnswers\)\)')
 }
-T 'the ai-memory status check no longer passes on any output' {
+T 'the status check judges by exit code, not by grepping output' {
     $code = Get-Content $src -Raw
-    ($code -notmatch '\$o -and \$o\.Length -gt 0') -and ($code -match 'refused\|unreachable')
+    # grepping for 'error' matched PowerShell's own NativeCommandError
+    # decoration and failed a command that had succeeded
+    ($code -notmatch '\$o -and \$o\.Length -gt 0') -and ($code -notmatch "notmatch 'refused")
+}
+T 'stderr decoration is stripped from captured native output' {
+    $code = Get-Content $src -Raw
+    ($code -match 'System\.Management\.Automation\.ErrorRecord') -and
+    ($code -match '\$_\.Exception\.Message')
+}
+T 'every HTTP probe goes through the non-throwing helper' {
+    $code = (Get-Content $src) | Where-Object { $_.TrimStart() -notmatch '^#' }
+    $direct = $code | Where-Object {
+        $_ -match 'Invoke-WebRequest' -and $_ -notmatch '-Headers \$headers' -and $_ -notmatch 'UseBasicParsing `$'
+    }
+    if ($direct) { $direct | ForEach-Object { Write-Host "     $_" -ForegroundColor DarkGray } }
+    $direct.Count -eq 0
+}
+T 'Get-HttpStatus returns 0 when nothing is listening' {
+    (Get-HttpStatus 'http://127.0.0.1:59999/nope' -TimeoutSec 2) -eq 0
 }
 T 'WinSW retries a crash loop more than once' {
     $code = Get-Content $src -Raw
