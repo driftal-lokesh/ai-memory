@@ -46,6 +46,7 @@ Already cloned? Just:
 | `-Reach Lan` | | No router changes. Lap B must be on the same Wi-Fi. |
 | `-SkipDrive` | | Backups stay local instead of going to Google Drive. |
 | `-KeepBackups 14` | 14 | How many daily archives to retain. |
+| `-SecretsFile <path>` | `Desktop\ai-memory-secrets.txt` | Where the recovery sheet is written. |
 | `-Port 49374` | 49374 | ai-memory listen port. |
 | `-WgPort 51820` | 51820 | WireGuard UDP port (the one you forward). |
 
@@ -65,6 +66,16 @@ native-command stderr differently, so all native calls go through one wrapper.
 | 4 | Generates the auth token, installs the WinSW service, disables sleep, creates per-machine `aim_` API keys, wires this laptop's Claude Code, registers the daily backup task |
 | 5 | Runs 8 end-to-end checks and reports every failure with its cause |
 | 6 | Prints Lap B's MCP JSON, the backup passphrase, and the router instructions |
+
+## The recovery sheet
+
+Setup writes `ai-memory-secrets.txt` to your Desktop and ACLs it to your user
+alone. It holds the backup passphrase, all three tokens, Lap B's MCP JSON, the
+full `lap-b.conf`, and the web UI credentials — everything needed to rebuild
+this from nothing.
+
+It is plaintext by necessity. Move it into a password manager and delete it.
+Leaving the passphrase only on this laptop defeats the point of the backups.
 
 ## Three things the script cannot do for you
 

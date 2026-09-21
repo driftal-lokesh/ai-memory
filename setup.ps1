@@ -30,7 +30,8 @@ param(
     [string] $WgSubnet     = '10.8.0',
     [int]    $KeepBackups  = 14,
     [string] $UserName     = $env:USERNAME,
-    [switch] $NoPause
+    [switch] $NoPause,
+    [string] $SecretsFile  = (Join-Path $env:USERPROFILE 'Desktop\ai-memory-secrets.txt')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -626,10 +627,108 @@ function Step5-Test {
     }
 }
 
+# ------------------------------------------------------------------ secrets
+
+# Everything needed to rebuild this setup, or to read the backups, in one file.
+# Written last so it can include whatever the run produced, and ACL'd to this
+# user only. It is plaintext by necessity -- it is the recovery sheet.
+function Write-Secrets {
+    $pass = [Environment]::GetEnvironmentVariable('AI_MEMORY_BACKUP_PASSPHRASE', 'User')
+    $wgDir = Join-Path $DataDir 'wireguard'
+    $srvConf = Join-Path $wgDir 'ai-memory-wg0.conf'
+    $cliConf = Join-Path $RepoRoot 'lap-b.conf'
+    $url = "http://$($script:McpHost):$Port/mcp"
+
+    $sb = [System.Text.StringBuilder]::new()
+    function A ($t) { [void]$sb.AppendLine($t) }
+
+    A "ai-memory -- recovery sheet"
+    A "generated $(Get-Date -Format 'yyyy-MM-dd HH:mm') on $env:COMPUTERNAME by $env:USERNAME"
+    A ""
+    A "THIS FILE IS PLAINTEXT. Move it into a password manager and delete it."
+    A "The backup passphrase below is the ONLY key to your Google Drive archives."
+    A "If it exists nowhere but this laptop, the backups die with this laptop."
+    A ""
+    A ("=" * 70)
+    A "BACKUP PASSPHRASE   (AES-256-GCM, decrypts *.tar.gz.enc)"
+    A ("=" * 70)
+    A ""
+    A "  $(if ($pass) { $pass } else { '<not set -- run setup again>' })"
+    A ""
+    A "  restore:  Stop-Service ai-memory"
+    A "            `$env:AI_MEMORY_BACKUP_PASSPHRASE = '<above>'"
+    A "            python memory_backup.py restore"
+    A ""
+    A ("=" * 70)
+    A "TOKENS"
+    A ("=" * 70)
+    A ""
+    A "  root (admin, backups)   $($script:RootToken)"
+    A "  lap-a  (this laptop)    $($script:Keys.'lap-a')"
+    A "  lap-b  (other laptop)   $($script:Keys.'lap-b')"
+    A ""
+    A "  revoke one:  ai-memory api-key revoke <id>"
+    A "  list:        ai-memory api-key list"
+    A ""
+    A ("=" * 70)
+    A "LAP B -- MCP CONFIG"
+    A ("=" * 70)
+    A ""
+    A '  {'
+    A '    "mcpServers": {'
+    A '      "ai-memory": {'
+    A "        `"url`": `"$url`","
+    A ('        "headers": { "Authorization": "Bearer ' + $script:Keys.'lap-b' + '" }')
+    A '      }'
+    A '    }'
+    A '  }'
+    A ""
+    A "  or:  ai-memory install-mcp   --client claude-code --apply --server-url http://$($script:McpHost):$Port --auth-token $($script:Keys.'lap-b')"
+    A "       ai-memory install-hooks --agent  claude-code --apply --server-url http://$($script:McpHost):$Port --auth-token $($script:Keys.'lap-b')"
+    A ""
+
+    if ($Reach -eq 'Wireguard' -and (Test-Path $cliConf)) {
+        A ("=" * 70)
+        A "WIREGUARD"
+        A ("=" * 70)
+        A ""
+        A "  server config  $srvConf"
+        A "  Lap B config   $cliConf   (import this on Lap B)"
+        A "  router         forward UDP $WgPort to $($script:LanIp)"
+        A ""
+        A "  lap-b.conf contents:"
+        A ""
+        foreach ($l in (Get-Content $cliConf)) { A "    $l" }
+        A ""
+    }
+
+    foreach ($n in $script:Notes) {
+        if ($n -match 'password') { A ("=" * 70); A "WEB UI"; A ("=" * 70); A ""; A "  $n"; A "" }
+    }
+
+    A ("=" * 70)
+    A "PATHS"
+    A ("=" * 70)
+    A ""
+    A "  data       $DataDir"
+    A "  backups    $($script:BackupDest)"
+    A "  repo       $RepoRoot"
+    A "  web UI     http://127.0.0.1:$Port"
+    A ""
+
+    Set-Content -Path $SecretsFile -Value $sb.ToString() -Encoding UTF8
+
+    # this user only -- strip inheritance so the Users group loses access
+    Native { icacls $SecretsFile /inheritance:r /grant:r "$($env:USERNAME):(F)" } | Out-Null
+    Ok "secrets written -> $SecretsFile"
+}
+
 # ------------------------------------------------------------------ step 6
 
 function Step6-Report {
     Head 6 'Result'
+
+    try { Write-Secrets } catch { Warn "could not write the secrets file: $($_.Exception.Message)" }
 
     $pass = ($script:Checks | Where-Object { $_.p }).Count
     $tot  = $script:Checks.Count
@@ -663,6 +762,13 @@ function Step6-Report {
     Write-Host "  ---------------- WHAT YOU STILL DO ----------------" -ForegroundColor Cyan
     Say ""
     $n = 1
+
+    if (-not $script:NewPassphrase) {
+        Say "  $n. Secrets (tokens, passphrase, Lap B config) are in:"
+        Write-Host "        $SecretsFile" -ForegroundColor Yellow
+        Say "     Move it into a password manager and delete it."
+        Say ""; $n++
+    }
 
     if ($script:NewPassphrase) {
         Write-Host "  $n. SAVE THIS BACKUP PASSPHRASE SOMEWHERE OFF THIS LAPTOP." -ForegroundColor Red
@@ -701,6 +807,7 @@ function Step6-Report {
     Say "    Data            $DataDir"
     Say "    Backups         $($script:BackupDest)   (daily 02:00, keep $KeepBackups)"
     Say "    Service         Get-Service ai-memory   /   Restart-Service ai-memory"
+    Say "    Secrets file    $SecretsFile"
     Say "    Manual backup   python memory_backup.py backup"
     Say "    Verify backup   python memory_backup.py verify"
     Say "    Restore         Stop-Service ai-memory; python memory_backup.py restore"

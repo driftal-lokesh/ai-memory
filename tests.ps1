@@ -216,7 +216,25 @@ T 'no API key or username baked in' {
     $bad.Count -eq 0
 }
 
-# --- 10. MCP URL always carries the mandatory /mcp suffix ----------------
+# --- 10. the secrets file ------------------------------------------------
+T 'the secrets file is ACL-restricted to the current user' {
+    (Get-Content $src -Raw) -match 'icacls.+/inheritance:r.+/grant:r'
+}
+T 'the secrets file is gitignored' {
+    (Get-Content (Join-Path $PSScriptRoot '.gitignore')) -contains 'ai-memory-secrets.txt'
+}
+T 'Write-Secrets failing cannot abort the run' {
+    # it holds the only copy of the passphrase; a permissions hiccup there must
+    # not take down a setup that otherwise succeeded
+    (Get-Content $src -Raw) -match 'try \{ Write-Secrets \} catch'
+}
+T 'the secrets path is under the user profile, not a fixed drive' {
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($src, [ref]$null, [ref]$null)
+    $p = $ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'SecretsFile' }
+    $p.DefaultValue.Extent.Text -match 'USERPROFILE'
+}
+
+# --- 11. MCP URL always carries the mandatory /mcp suffix ----------------
 T 'every printed MCP url ends in /mcp' {
     $txt = Get-Content $src -Raw
     $urls = [regex]::Matches($txt, 'http://\$\([^)]+\):\$Port(/mcp)?') | ForEach-Object { $_.Value }

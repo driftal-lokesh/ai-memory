@@ -5,3 +5,4 @@ lap-b.conf
 .lap-keys.json
 __pycache__/
 *.pyc
+ai-memory-secrets.txt
