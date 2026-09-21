@@ -174,6 +174,44 @@ function Aim {
     }
 }
 
+# Who is listening on the ai-memory port, if anyone. A stale server process
+# holding it is the usual reason a freshly installed service will not start.
+function Get-PortHolder {
+    try {
+        $c = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $c) { return $null }
+        $p = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue
+        if ($p) { return "$($p.ProcessName) (pid $($p.Id))" }
+        return "pid $($c.OwningProcess)"
+    }
+    catch { return $null }
+}
+
+function Wait-PortFree {
+    for ($i = 0; $i -lt 20; $i++) {
+        if (-not (Get-PortHolder)) { return $true }
+        Start-Sleep 1
+    }
+    Warn "port $Port is still held by $(Get-PortHolder)"
+    return $false
+}
+
+# Telling someone to go read a log file is not an error message. Print it.
+function Show-ServerLogs {
+    $logs = Join-Path $DataDir 'logs'
+    if (-not (Test-Path $logs)) { Warn "no log directory at $logs"; return }
+    foreach ($name in @('ai-memory.err.log', 'ai-memory.wrapper.log', 'ai-memory.out.log')) {
+        $f = Join-Path $logs $name
+        if (-not (Test-Path $f)) { continue }
+        $tail = Get-Content $f -Tail 25 -ErrorAction SilentlyContinue
+        if (-not $tail) { continue }
+        Say ""
+        Write-Host "  ---- $name (last 25 lines) ----" -ForegroundColor Yellow
+        $tail | ForEach-Object { Say "  $_" }
+    }
+    Say ""
+}
+
 # ------------------------------------------------------------------ step 0
 
 function Step0-Prereqs {
@@ -451,7 +489,8 @@ function Step4-Service {
     $allowed = @($script:McpHost, 'localhost', '127.0.0.1', $script:LanIp) -join ','
     # Absolute paths only -- the service runs as LocalSystem and would resolve
     # %LOCALAPPDATA% to a different profile.
-    @"
+    $xmlPath = Join-Path $SvcDir 'ai-memory-service.xml'
+    $xml = @"
 <service>
   <id>ai-memory</id>
   <name>ai-memory MCP server</name>
@@ -466,21 +505,56 @@ function Step4-Service {
   <env name="AI_MEMORY_ALLOWED_HOSTS" value="$allowed"/>
   <env name="AI_MEMORY_DATA_DIR" value="$DataDir"/>
 </service>
-"@ | Set-Content (Join-Path $SvcDir 'ai-memory-service.xml') -Encoding UTF8
+"@
 
-    if (Get-Service 'ai-memory' -ErrorAction SilentlyContinue) {
-        Info 'reinstalling service with current config'
-        Native { & $winsw stop }      | Out-Null
-        Native { & $winsw uninstall } | Out-Null
-        Start-Sleep 2
+    $existing = Get-Service 'ai-memory' -ErrorAction SilentlyContinue
+    $configChanged = -not (Test-Path $xmlPath) -or
+                     ((Get-Content $xmlPath -Raw) -ne $xml)
+    Set-Content $xmlPath -Value $xml -Encoding UTF8
+
+    if ($existing -and -not $configChanged) {
+        # nothing to reinstall -- a restart is enough and avoids the SCM
+        # pending-deletion dance entirely
+        Info 'service config unchanged; restarting'
+        Native { & $winsw stop } | Out-Null
+        Wait-PortFree
+        Native { & $winsw start } | Out-Null
     }
-    $inst = Native { & $winsw install }
-    if ($script:NativeExit -ne 0) { Die "WinSW install failed:`n$inst" }
-    Native { & $winsw start } | Out-Null
-    Start-Sleep 4
-    $svc = Get-Service 'ai-memory' -ErrorAction SilentlyContinue
+    else {
+        if ($existing) {
+            Info 'service config changed; reinstalling'
+            Native { & $winsw stop } | Out-Null
+            Native { & $winsw uninstall } | Out-Null
+            # SCM keeps a deleted service name reserved until every handle to it
+            # closes. Installing into that window succeeds but the service will
+            # not start. Wait for the name to actually disappear.
+            $gone = $false
+            for ($i = 0; $i -lt 30; $i++) {
+                if (-not (Get-Service 'ai-memory' -ErrorAction SilentlyContinue)) { $gone = $true; break }
+                Start-Sleep 1
+            }
+            if (-not $gone) {
+                Die 'the old ai-memory service is still registered (marked for deletion). Close Services.msc and any Event Viewer window, then re-run.'
+            }
+            Wait-PortFree
+        }
+        $inst = Native { & $winsw install }
+        if ($script:NativeExit -ne 0) { Die "WinSW install failed:`n$inst" }
+        Native { & $winsw start } | Out-Null
+    }
+
+    # poll instead of guessing at a sleep duration
+    $svc = $null
+    for ($i = 0; $i -lt 30; $i++) {
+        $svc = Get-Service 'ai-memory' -ErrorAction SilentlyContinue
+        if ($svc -and $svc.Status -eq 'Running') { break }
+        Start-Sleep 1
+    }
     if (-not $svc -or $svc.Status -ne 'Running') {
-        Die "service did not start. Check $DataDir\logs\ai-memory.err.log"
+        Show-ServerLogs
+        $held = Get-PortHolder
+        if ($held) { Say "  port $Port is held by: $held" }
+        Die "service did not start (status: $(if ($svc) { $svc.Status } else { 'not installed' }))"
     }
     Ok 'service running (survives reboot)'
 

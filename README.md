@@ -135,7 +135,8 @@ Start-Service ai-memory
 
 | Symptom | Fix |
 |---|---|
-| Service won't start | `%LOCALAPPDATA%\ai-memory\logs\ai-memory.err.log` |
+| Service won't start | setup prints the last 25 lines of every server log for you. If it says the service is "marked for deletion", close Services.msc and Event Viewer, or reboot. |
+| Port 49374 already held | setup names the process holding it. A stale `ai-memory.exe` is the usual culprit: `Stop-Process -Name ai-memory -Force` |
 | Lap B can't connect | Is the WireGuard tunnel active on Lap B? Is UDP 51820 forwarded? Did your home IP change — check `Endpoint` in `lap-b.conf` |
 | `401` with a token | Key was revoked or truncated. `ai-memory api-key add --username <you> --label lap-b` |
 | Backup fails with `401 auth required` | `backup` is a server call (`POST /admin/backup`), not a disk operation. It needs `AI_MEMORY_AUTH_TOKEN` — setup exports it, and also writes `%LOCALAPPDATA%\ai-memory\.root-token`. |

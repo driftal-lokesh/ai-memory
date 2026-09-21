@@ -234,7 +234,32 @@ T 'the secrets path is under the user profile, not a fixed drive' {
     $p.DefaultValue.Extent.Text -match 'USERPROFILE'
 }
 
-# --- 11. MCP URL always carries the mandatory /mcp suffix ----------------
+# --- 11. service lifecycle ------------------------------------------------
+T 'the service is only reinstalled when its config actually changed' {
+    $code = Get-Content $src -Raw
+    ($code -match '\$configChanged') -and ($code -match 'config unchanged; restarting')
+}
+T 'a reinstall waits for SCM to release the service name' {
+    # installing while the old name is "marked for deletion" succeeds but the
+    # service will not start -- this is what broke the second run
+    (Get-Content $src -Raw) -match 'marked for deletion'
+}
+T 'service readiness is polled, not slept on' {
+    $code = Get-Content $src -Raw
+    # the old code slept a fixed 4s and hoped; now it polls for up to 30
+    ($code -match 'poll instead of guessing') -and ($code -notmatch 'Start-Sleep 4')
+}
+T 'a failed start prints the logs instead of naming a file' {
+    $code = Get-Content $src -Raw
+    ($code -match 'function Show-ServerLogs') -and ($code -match 'Show-ServerLogs\s*\n') -and
+    ($code -notmatch 'did not start\. Check')
+}
+T 'port contention is reported by name' {
+    $code = Get-Content $src -Raw
+    ($code -match 'function Get-PortHolder') -and ($code -match 'is held by')
+}
+
+# --- 12. MCP URL always carries the mandatory /mcp suffix ----------------
 T 'every printed MCP url ends in /mcp' {
     $txt = Get-Content $src -Raw
     $urls = [regex]::Matches($txt, 'http://\$\([^)]+\):\$Port(/mcp)?') | ForEach-Object { $_.Value }
