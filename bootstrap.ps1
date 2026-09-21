@@ -12,7 +12,7 @@
 [CmdletBinding()]
 param(
     [string] $RepoUrl = $(if ($env:AI_MEMORY_OPS_REPO) { $env:AI_MEMORY_OPS_REPO } else { 'https://github.com/driftal-lokesh/ai-memory.git' }),
-    [string] $Dest    = 'C:\ai-memory-ops',
+    [string] $Dest    = (Join-Path $env:SystemDrive '\ai-memory-ops'),
     [ValidateSet('Wireguard', 'Lan')] [string] $Reach = 'Wireguard'
 )
 

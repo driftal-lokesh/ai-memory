@@ -191,7 +191,32 @@ T 'exit codes are read from NativeExit, not the stale LASTEXITCODE' {
     ([regex]::Matches($code, '\$LASTEXITCODE')).Count -le 2
 }
 
-# --- 9. MCP URL always carries the mandatory /mcp suffix -----------------
+# --- 9. nothing machine-specific is baked in -----------------------------
+$both = @($src, (Join-Path $PSScriptRoot 'bootstrap.ps1'))
+
+T 'no literal drive-letter paths in either script' {
+    $lit = $both | ForEach-Object { Get-Content $_ } |
+        Where-Object { $_ -match '[A-Za-z]:\\' } |
+        Where-Object { $_ -notmatch 'env:|Join-Path|^\s*#|LOCALAPPDATA' }
+    if ($lit) { $lit | ForEach-Object { Write-Host "     $_" -ForegroundColor DarkGray } }
+    $lit.Count -eq 0
+}
+
+T 'no hardcoded IP address' {
+    $ips = $both | ForEach-Object { Get-Content $_ } |
+        Where-Object { $_ -match '\b\d{1,3}(\.\d{1,3}){3}\b' } |
+        Where-Object { $_ -notmatch '127\.0\.0\.1|0\.0\.0\.0|10\.8\.0|WgSubnet|^\s*#' }
+    if ($ips) { $ips | ForEach-Object { Write-Host "     $_" -ForegroundColor DarkGray } }
+    $ips.Count -eq 0
+}
+
+T 'no API key or username baked in' {
+    $bad = $both | ForEach-Object { Get-Content $_ } |
+        Where-Object { $_ -match 'aim_[A-Za-z0-9]{10}' }
+    $bad.Count -eq 0
+}
+
+# --- 10. MCP URL always carries the mandatory /mcp suffix ----------------
 T 'every printed MCP url ends in /mcp' {
     $txt = Get-Content $src -Raw
     $urls = [regex]::Matches($txt, 'http://\$\([^)]+\):\$Port(/mcp)?') | ForEach-Object { $_.Value }

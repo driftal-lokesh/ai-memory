@@ -186,13 +186,13 @@ function Step0-Prereqs {
     if (-not (Have 'git'))    { Winget-Install 'Git.Git' 'Git' }           else { Ok 'git present' }
     if (-not (Have 'python')) { Winget-Install 'Python.Python.3.12' 'Python 3.12' } else { Ok 'python present' }
 
-    if ($Reach -eq 'Wireguard' -and -not (Test-Path 'C:\Program Files\WireGuard\wg.exe')) {
+    if ($Reach -eq 'Wireguard' -and -not (Test-Path (Join-Path $env:ProgramFiles 'WireGuard\wg.exe'))) {
         Winget-Install 'WireGuard.WireGuard' 'WireGuard'
     }
     elseif ($Reach -eq 'Wireguard') { Ok 'WireGuard present' }
 
     if (-not $SkipDrive) {
-        $driveApp = 'C:\Program Files\Google\Drive File Stream\launch.bat'
+        $driveApp = Join-Path $env:ProgramFiles 'Google\Drive File Stream\launch.bat'
         if (-not (Test-Path $driveApp)) { Winget-Install 'Google.GoogleDrive' 'Google Drive for Desktop' }
         else { Ok 'Google Drive for Desktop present' }
     }
@@ -274,7 +274,7 @@ function Step2-Network {
     # --- WireGuard -------------------------------------------------------
     $wgDir = Join-Path $DataDir 'wireguard'
     New-Item -ItemType Directory -Force $wgDir | Out-Null
-    $wg = 'C:\Program Files\WireGuard\wg.exe'
+    $wg = Join-Path $env:ProgramFiles 'WireGuard\wg.exe'
     if (-not (Test-Path $wg)) { Die "wg.exe missing at $wg" }
 
     $srvConf = Join-Path $wgDir 'ai-memory-wg0.conf'
@@ -333,7 +333,8 @@ PersistentKeepalive = 25
     if ($svc) { Ok 'WireGuard tunnel service already installed' }
     else {
         Info 'installing tunnel service'
-        $wgOut = Native { & 'C:\Program Files\WireGuard\wireguard.exe' /installtunnelservice $srvConf }
+        $wgExe = Join-Path $env:ProgramFiles 'WireGuard\wireguard.exe'
+        $wgOut = Native { & $wgExe /installtunnelservice $srvConf }
         if ($script:NativeExit -ne 0) { Die "WireGuard tunnel install failed:`n$wgOut" }
         Start-Sleep 3
         Ok 'tunnel service installed'
@@ -375,7 +376,7 @@ function Step3-Drive {
     $found = Find-DriveRoot
     if (-not $found) {
         Info 'launching Google Drive -- sign in and click Allow in the window that opens'
-        $launch = 'C:\Program Files\Google\Drive File Stream\launch.bat'
+        $launch = Join-Path $env:ProgramFiles 'Google\Drive File Stream\launch.bat'
         if (Test-Path $launch) { Start-Process $launch } else { Warn 'launcher not found; start Google Drive manually' }
 
         Say ''
