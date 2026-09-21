@@ -310,6 +310,21 @@ function Build-AllowedHosts {
     return (($hosts | Where-Object { $_ } | Sort-Object -Unique) -join ',')
 }
 
+# Does a stored aim_ key still authenticate? Returns $false only on a definite
+# 401; anything else (server down, 403, network) is inconclusive and keeps the
+# existing keys rather than throwing them away on a transient failure.
+function Test-KeysValid ($keyFile) {
+    try { $keys = Get-Content $keyFile -Raw | ConvertFrom-Json } catch { return $false }
+    $first = @($keys.PSObject.Properties)[0]
+    if (-not $first) { return $false }
+    try {
+        Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$Port/handoff" -TimeoutSec 10 `
+            -Headers @{ Authorization = "Bearer $($first.Value)" } | Out-Null
+        return $true
+    }
+    catch { return ((StatusOf $_) -ne 401) }
+}
+
 # Rewrite just the allowlist env var in the service XML, in place.
 function Set-AllowedHostsInXml ($xmlPath, $value) {
     $script:AllowedHosts = $value
@@ -878,7 +893,18 @@ function Step4-Service {
     Ok 'sleep disabled on AC power'
 
     # --- user + per-machine keys ----------------------------------------
+    #
+    # aim_ credentials are hashed with [auth].token_pepper. Change the pepper
+    # and every existing key stops verifying -- the server's own words are
+    # "restore the original pepper from configuration backup". Keys minted
+    # before we started writing a pepper are therefore dead, and reusing them
+    # produces a 401 that looks like a config problem. Test them, and remint
+    # if they no longer work.
     $keyFile = Join-Path $DataDir '.lap-keys.json'
+    if ((Test-Path $keyFile) -and -not (Test-KeysValid $keyFile)) {
+        Warn 'stored API keys no longer authenticate (token_pepper changed); reminting'
+        Remove-Item $keyFile -Force
+    }
     if (Test-Path $keyFile) {
         $script:Keys = Get-Content $keyFile -Raw | ConvertFrom-Json
         Ok 'reusing existing API keys'
@@ -975,7 +1001,9 @@ function Step5-Test {
     Check 'service is Running' { (Get-Service 'ai-memory').Status -eq 'Running' }
 
     Check 'ai-memory status reports a reachable server' {
-        $o = Aim @('status') -AllowFail
+        # status talks to the server, so it needs the root credential like any
+        # other client; without it the call just 401s
+        $o = Aim @('status') -EnvVars @{ AI_MEMORY_AUTH_TOKEN = $script:RootToken } -AllowFail
         # any output at all used to pass this, including a failure message
         ($script:NativeExit -eq 0) -and ($o -notmatch 'refused|unreachable|not running|error')
     }

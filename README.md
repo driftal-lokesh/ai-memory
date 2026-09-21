@@ -117,7 +117,7 @@ every browser credential". So it costs nothing here.
 | key | why |
 |---|---|
 | `recovery_token` | else: no recoverable root user exists |
-| `token_pepper` | required for native `aim_` API keys |
+| `token_pepper` | required for native `aim_` API keys — and baked into their hashes, so changing it invalidates every existing key |
 | `bearer_token` | root credential for admin calls and backups |
 | `secure_cookie = true` | else: refuses to bind non-loopback |
 
@@ -249,7 +249,8 @@ reason printed above).
 | Service won't start | setup prints the last 25 lines of every server log for you. If it says the service is "marked for deletion", close Services.msc and Event Viewer, or reboot. |
 | Port 49374 already held | setup names the process holding it. A stale `ai-memory.exe` is the usual culprit: `Stop-Process -Name ai-memory -Force` |
 | Lap B can't connect | Is the WireGuard tunnel active on Lap B? Is UDP 51820 forwarded? Did your home IP change — check `Endpoint` in `lap-b.conf` |
-| `401` with a token | Key was revoked or truncated. `ai-memory api-key add --username <you> --label lap-b` |
+| `401` with a valid-looking `aim_` key | The key was minted under a different `[auth].token_pepper` and no longer verifies — the server's own words are "restore the original pepper from configuration backup". Re-run `setup.ps1`; it detects this and remints. |
+| `403 forbidden host` | The Host your client sends is not in the allowlist, which has no wildcard. `.\setup.ps1 -AllowedHosts '...'` |
 | Backup fails with `401 auth required` | `backup` is a server call (`POST /admin/backup`), not a disk operation. It needs `AI_MEMORY_AUTH_TOKEN` — setup exports it, and also writes `%LOCALAPPDATA%\ai-memory\.root-token`. |
 | `restore` refuses to run | Another ai-memory process is alive. `Stop-Service ai-memory` first. |
 | Lap A rebooted, server gone | It shouldn't. `Get-Service ai-memory`. Never start the server from a Scheduled Task — it is silently killed at the next reboot. |

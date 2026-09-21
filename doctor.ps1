@@ -109,7 +109,10 @@ if (Test-Path $errLog) {
         Detail "       or pass the exact host: .\setup.ps1 -AllowedHosts '<host1>,<host2>'"
     }
     if ($txt -match 'token_pepper') {
-        Write-Host "  MATCH: [auth].token_pepper is missing -- aim_ API keys need it." -ForegroundColor Red
+        Write-Host "  MATCH: [auth].token_pepper is missing or changed." -ForegroundColor Red
+        Detail "       aim_ keys are hashed with the pepper. Change it and every"
+        Detail "       existing key stops verifying with 401. setup.ps1 detects this"
+        Detail "       and remints; it also persists the pepper so it stays stable."
     }
 }
 else { Detail 'no error log yet' }

@@ -360,6 +360,27 @@ T "a literal '*' is refused and enumerated instead" {
     $r = Build-AllowedHosts
     ($r -notmatch '\*') -and ($r -match '127\.0\.0\.1')
 }
+T 'stale API keys are detected and reminted' {
+    $code = Get-Content $src -Raw
+    # aim_ keys are hashed with token_pepper; changing the pepper kills them
+    ($code -match 'function Test-KeysValid') -and
+    ($code -match 'Test-KeysValid \$keyFile') -and
+    ($code -match 'token_pepper changed')
+}
+T 'key validation only discards keys on a definite 401' {
+    $code = Get-Content $src -Raw
+    $fn = [regex]::Match($code, 'function Test-KeysValid[\s\S]*?\n\}').Value
+    # a server that is down or 403ing must not cause keys to be thrown away
+    ($fn -match '-ne 401')
+}
+T 'the token pepper is persisted so it stays stable across runs' {
+    (Get-Content $src -Raw) -match "New-Secret \(Join-Path \`$DataDir '\.token-pepper'\)"
+}
+T 'ai-memory status is called with the root token' {
+    $code = Get-Content $src -Raw
+    $m = [regex]::Match($code, "Aim @\('status'\)[^\n]*")
+    $m.Value -match 'AI_MEMORY_AUTH_TOKEN'
+}
 T 'the allowlist is verified with a real request after the service starts' {
     $code = Get-Content $src -Raw
     # a healthy service proves nothing: the allowlist is enforced per request
