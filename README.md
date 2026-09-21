@@ -47,7 +47,7 @@ Already cloned? Just:
 | `-SkipDrive` | | Backups stay local instead of going to Google Drive. |
 | `-KeepBackups 14` | 14 | How many daily archives to retain. |
 | `-SecretsFile <path>` | `Desktop\ai-memory-secrets.txt` | Where the recovery sheet is written. |
-| `-EnableWeb` | off | Serve the browser UI. Off by default: it arms human authentication, which the MCP server does not need. |
+| `-EnableWeb` | off | Serve the browser UI. Off by default, and **incompatible with `-Reach Wireguard`/`Lan`**: the server refuses human login on a non-loopback plain-HTTP bind, because that would send session cookies in the clear. It needs an HTTPS reverse proxy. |
 | `-Port 49374` | 49374 | ai-memory listen port. |
 | `-WgPort 51820` | 51820 | WireGuard UDP port (the one you forward). |
 
@@ -87,6 +87,18 @@ Leaving the passphrase only on this laptop defeats the point of the backups.
    `-Reach Wireguard`. Give Lap A a DHCP reservation while you're in there.
 3. **Set up Lap B.** Install WireGuard, import `lap-b.conf`, run the printed
    `install-mcp` line.
+
+## Why there is no web UI by default
+
+The server will not serve human login on a non-loopback plain-HTTP address:
+
+> refusing human authentication on non-loopback plain HTTP address 0.0.0.0:49374:
+> passwords and session cookies require `[auth].secure_cookie=true` behind a
+> trusted HTTPS reverse proxy
+
+Binding wide is the entire point — Lap B has to reach it. So setup disables
+human login and runs on machine credentials only: `[auth].bearer_token` for
+admin operations and one `aim_` API key per laptop. Nothing needs a password.
 
 ## Security shape
 

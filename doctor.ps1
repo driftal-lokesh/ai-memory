@@ -79,6 +79,15 @@ if (Test-Path $errLog) {
     if ($txt -match 'Address already in use|os error 10048') {
         Write-Host "  MATCH: something else already holds port $Port." -ForegroundColor Red
     }
+    if ($txt -match 'refusing human authentication on non-loopback') {
+        Write-Host "  MATCH: a human user exists and the server binds non-loopback." -ForegroundColor Red
+        Detail "       Human login sends session cookies, which the server will not do"
+        Detail "       over plain HTTP off loopback. Binding wide is the point here."
+        Detail "       Fix: ai-memory user disable <name> --yes   (setup does this now)"
+    }
+    if ($txt -match 'token_pepper') {
+        Write-Host "  MATCH: [auth].token_pepper is missing -- aim_ API keys need it." -ForegroundColor Red
+    }
 }
 else { Detail 'no error log yet' }
 

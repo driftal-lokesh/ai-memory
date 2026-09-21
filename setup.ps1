@@ -207,6 +207,7 @@ function Test-ServeDirectly {
 
     $env:AI_MEMORY_AUTH_TOKEN = $script:RootToken
     if ($script:RecoveryToken) { $env:AI_MEMORY_AUTH__RECOVERY_TOKEN = $script:RecoveryToken }
+    if ($script:AllowedHosts) { $env:AI_MEMORY_ALLOWED_HOSTS = $script:AllowedHosts }
     $serveArgs = "--data-dir `"$DataDir`" serve --transport http --bind $($script:BindIp):$Port$(if ($EnableWeb) { ' --enable-web' })"
     Say ""
     Write-Host "  ---- running the server directly for 6s ----" -ForegroundColor Yellow
@@ -277,6 +278,21 @@ function Show-ServerLogs {
         $tail | ForEach-Object { Say "  $_" }
     }
     Say ""
+}
+
+# 32 random bytes, base64, url-safe-ish. Persisted by the caller when it needs
+# to survive a re-run.
+function New-Secret {
+    param([string] $File)
+    if ($File -and (Test-Path $File)) { return (Get-Content $File -Raw).Trim() }
+    $b = [byte[]]::new(32)
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b)
+    $v = [Convert]::ToBase64String($b).TrimEnd('=')
+    if ($File) {
+        $v | Set-Content $File -Encoding ASCII
+        (Get-Item $File).Attributes = 'Hidden'
+    }
+    return $v
 }
 
 # Sets key = "value" inside [section] of a TOML file, creating either if
@@ -595,7 +611,8 @@ function Step4-Service {
         Unblock-File $winsw
     }
 
-    $allowed = @($script:McpHost, 'localhost', '127.0.0.1', $script:LanIp) -join ','
+    $allowed = @($script:McpHost, 'localhost', '127.0.0.1', '::1', $script:LanIp) -join ','
+    $script:AllowedHosts = $allowed
 
     # --enable-web switches on human authentication, and human auth refuses to
     # boot without a recoverable root user or [auth].recovery_token. The MCP
@@ -607,22 +624,17 @@ function Step4-Service {
     #   "human authentication is enabled but no recoverable root user exists"
     # Setting it when it is not needed costs nothing; not setting it is a
     # crash loop.
-    $recFile = Join-Path $DataDir '.recovery-token'
-    if (Test-Path $recFile) { $script:RecoveryToken = (Get-Content $recFile -Raw).Trim() }
-    else {
-        $rb = [byte[]]::new(32)
-        [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($rb)
-        $script:RecoveryToken = [Convert]::ToBase64String($rb).TrimEnd('=')
-        $script:RecoveryToken | Set-Content $recFile -Encoding ASCII
-        (Get-Item $recFile).Attributes = 'Hidden'
-    }
+    $script:RecoveryToken = New-Secret (Join-Path $DataDir '.recovery-token')
     # Human auth is armed by config -- a human user existing is enough, the
     # --enable-web flag is not required. Without [auth].recovery_token the
     # server exits on every start. The error names this key exactly, so write
     # it to config.toml rather than guessing at an environment variable.
     $cfg = Join-Path $DataDir 'config.toml'
     [void](Set-TomlKey -Path $cfg -Section 'auth' -Key 'recovery_token' -Value $script:RecoveryToken)
-    Ok 'config.toml: [auth].recovery_token set'
+    # required for native aim_ credentials
+    [void](Set-TomlKey -Path $cfg -Section 'auth' -Key 'token_pepper' -Value (New-Secret (Join-Path $DataDir '.token-pepper')))
+    [void](Set-TomlKey -Path $cfg -Section 'auth' -Key 'bearer_token' -Value $root)
+    Ok 'config.toml: [auth] recovery_token, token_pepper, bearer_token set'
     $webEnv = "`n  <env name=`"AI_MEMORY_AUTH__RECOVERY_TOKEN`" value=`"$($script:RecoveryToken)`"/>"
     $webArg = if ($EnableWeb) { ' --enable-web' } else { '' }
     # Absolute paths only -- the service runs as LocalSystem and would resolve
@@ -648,6 +660,7 @@ function Step4-Service {
 </service>
 "@
 
+    Disable-HumanLogin
     $existing = Get-Service 'ai-memory' -ErrorAction SilentlyContinue
     $configChanged = -not (Test-Path $xmlPath) -or
                      ((Get-Content $xmlPath -Raw).Trim() -ne $xml.Trim())
@@ -726,7 +739,8 @@ function Step4-Service {
         Ok 'reusing existing API keys'
     }
     else {
-        # only needed for the web UI; api-key add requires the user to exist
+        # a human user is what arms human auth, which cannot run on a
+        # non-loopback plain-HTTP bind. Only create one when the web UI is asked for.
         $u = if ($EnableWeb) {
             Aim @('user', 'add-human', '--username', $UserName, '--email', "$UserName@local", '--name', $UserName) `
                 -EnvVars @{ AI_MEMORY_AUTH_TOKEN = $root } -AllowFail
@@ -806,6 +820,32 @@ function Step4b-Backups {
     Register-ScheduledTask -TaskName 'ai-memory-backup' -Action $action -Trigger $trigger `
         -Settings $set -Force -RunLevel Limited | Out-Null
     Ok 'daily 02:00 encrypted backup task registered'
+}
+
+# Human login is incompatible with a non-loopback plain-HTTP bind: the server
+# refuses to start rather than send session cookies in the clear. Binding wide
+# is the whole point here, and aim_ API keys need no human login, so any human
+# user gets its login disabled. Without -EnableWeb nothing needs it.
+function Disable-HumanLogin {
+    if ($EnableWeb) {
+        Warn '-EnableWeb with a non-loopback bind needs an HTTPS reverse proxy; the server will refuse to start'
+        return
+    }
+    $out = Aim @('user', 'list') -EnvVars @{ AI_MEMORY_AUTH_TOKEN = $script:RootToken } -AllowFail
+    if ($script:NativeExit -ne 0) { return }
+
+    $names = @()
+    foreach ($line in ($out -split "`n")) {
+        if ($line -match '^\s*([A-Za-z0-9._-]+)\s' -and $line -notmatch 'username|^\s*-+\s*$|INFO|WARN') {
+            $names += $matches[1]
+        }
+    }
+    $names = $names | Sort-Object -Unique
+    foreach ($n in $names) {
+        $d = Aim @('user', 'disable', $n, '--yes') -EnvVars @{ AI_MEMORY_AUTH_TOKEN = $script:RootToken } -AllowFail
+        if ($script:NativeExit -eq 0) { Ok "human login disabled for '$n'" }
+    }
+    if (-not $names) { Info 'no human users to disable' }
 }
 
 # ------------------------------------------------------------------ step 5
