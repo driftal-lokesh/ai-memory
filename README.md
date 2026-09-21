@@ -131,6 +131,19 @@ Start-Service ai-memory
 
 `AI_MEMORY_BACKUP_PASSPHRASE` must be set to the passphrase you saved.
 
+## When something is wrong
+
+```powershell
+.\doctor.ps1
+```
+
+Reads only, changes nothing. Reports the service state and account, any running
+process, what holds port 49374, the HTTP response, every server log, the Windows
+event log entries, and then runs the server directly for six seconds to show
+what it actually says. It ends with a verdict: either the server runs fine on
+its own (so the fault is the service wrapper) or it exited by itself (with the
+reason printed above).
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -154,6 +167,7 @@ bootstrap.ps1       one-line entry: elevate, install git, clone, run setup
 setup.ps1           steps 0-6
 memory_backup.py    backup / restore / verify / prune, AES-256-GCM
 test_backup.py      crypto self-check (no framework, just asserts)
+doctor.ps1          read-only diagnosis when the service will not serve
 tests.ps1           offline checks for setup.ps1 (AST-loads its functions, runs nothing)
 lap-b.conf          generated; gitignored; holds a private key
 ```

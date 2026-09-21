@@ -286,7 +286,33 @@ T 'no automatic PowerShell variable is assigned to' {
     $bad.Count -eq 0
 }
 
-# --- 13. MCP URL always carries the mandatory /mcp suffix ----------------
+# --- 13. health is measured by serving, not by SCM ------------------------
+T 'readiness requires an HTTP answer, not just service status' {
+    $code = Get-Content $src -Raw
+    ($code -match 'function Wait-ServiceHealthy') -and ($code -match 'function Test-ServerAnswers') -and
+    ($code -match 'Test-ServerAnswers\)\)')
+}
+T 'the ai-memory status check no longer passes on any output' {
+    $code = Get-Content $src -Raw
+    ($code -notmatch '\$o -and \$o\.Length -gt 0') -and ($code -match 'refused\|unreachable')
+}
+T 'WinSW retries a crash loop more than once' {
+    $code = Get-Content $src -Raw
+    ([regex]::Matches($code, '<onfailure')).Count -ge 3 -and ($code -match '<resetfailure>')
+}
+T 'doctor.ps1 exists and parses' {
+    $d = Join-Path $PSScriptRoot 'doctor.ps1'
+    if (-not (Test-Path $d)) { return $false }
+    $e = $null
+    [void][System.Management.Automation.Language.Parser]::ParseFile($d, [ref]$null, [ref]$e)
+    $e.Count -eq 0
+}
+T 'doctor.ps1 only reads -- it installs and changes nothing' {
+    $d = Get-Content (Join-Path $PSScriptRoot 'doctor.ps1') -Raw
+    ($d -notmatch 'winget install|New-NetFirewallRule|Set-Content|Register-ScheduledTask|SetEnvironmentVariable')
+}
+
+# --- 14. MCP URL always carries the mandatory /mcp suffix ----------------
 T 'every printed MCP url ends in /mcp' {
     $txt = Get-Content $src -Raw
     $urls = [regex]::Matches($txt, 'http://\$\([^)]+\):\$Port(/mcp)?') | ForEach-Object { $_.Value }

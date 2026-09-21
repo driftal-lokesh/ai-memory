@@ -236,6 +236,29 @@ function Test-ServeDirectly {
     Say ""
 }
 
+# A service can report Running while its child process has already exited --
+# WinSW launched something, that is all SCM knows. The only honest test is
+# whether the port answers. Returns the service object when genuinely healthy,
+# $null otherwise.
+function Wait-ServiceHealthy {
+    for ($i = 0; $i -lt 30; $i++) {
+        $svc = Get-Service 'ai-memory' -ErrorAction SilentlyContinue
+        if ($svc -and $svc.Status -eq 'Running' -and (Test-ServerAnswers)) { return $svc }
+        Start-Sleep 1
+    }
+    return $null
+}
+
+# Any HTTP response means it is listening. 401 is a fine answer here: it proves
+# the server is up and auth is on.
+function Test-ServerAnswers {
+    try {
+        Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$Port/mcp" -TimeoutSec 3 | Out-Null
+        return $true
+    }
+    catch { return ((StatusOf $_) -ne 0) }
+}
+
 # Telling someone to go read a log file is not an error message. Print it.
 function Show-ServerLogs {
     $logs = Join-Path $DataDir 'logs'
@@ -540,6 +563,9 @@ function Step4-Service {
   <arguments>--data-dir "$DataDir" serve --transport http --bind $($script:BindIp):$Port --enable-web</arguments>
   <startmode>Automatic</startmode>
   <onfailure action="restart" delay="5 sec"/>
+  <onfailure action="restart" delay="10 sec"/>
+  <onfailure action="restart" delay="30 sec"/>
+  <resetfailure>1 hour</resetfailure>
   <log mode="roll"/>
   <logpath>$DataDir\logs</logpath>
   <env name="AI_MEMORY_AUTH_TOKEN" value="$root"/>
@@ -585,13 +611,8 @@ function Step4-Service {
     }
 
     # poll instead of guessing at a sleep duration
-    $svc = $null
-    for ($i = 0; $i -lt 30; $i++) {
-        $svc = Get-Service 'ai-memory' -ErrorAction SilentlyContinue
-        if ($svc -and $svc.Status -eq 'Running') { break }
-        Start-Sleep 1
-    }
-    if (-not $svc -or $svc.Status -ne 'Running') {
+    $svc = Wait-ServiceHealthy
+    if (-not $svc) {
         # one automatic retry: a stale ai-memory.exe squatting on the port is by
         # far the most common cause and it is trivially recoverable
         Warn 'service did not come up; clearing stale processes and retrying once'
@@ -601,15 +622,12 @@ function Step4-Service {
         }
         Wait-PortFree
         Native { & $winsw start } | Out-Null
-        for ($i = 0; $i -lt 30; $i++) {
-            $svc = Get-Service 'ai-memory' -ErrorAction SilentlyContinue
-            if ($svc -and $svc.Status -eq 'Running') { break }
-            Start-Sleep 1
-        }
+        $svc = Wait-ServiceHealthy
     }
 
-    if (-not $svc -or $svc.Status -ne 'Running') {
-        $status = if ($svc) { $svc.Status } else { 'not installed' }
+    if (-not $svc) {
+        $actual = Get-Service 'ai-memory' -ErrorAction SilentlyContinue
+        $status = if ($actual) { "$($actual.Status), but not answering on port $Port" } else { 'not installed' }
         Say ""
         Write-Host "  The service is $status. Everything known about why:" -ForegroundColor Yellow
         $held = Get-PortHolder
@@ -715,9 +733,10 @@ function Step5-Test {
 
     Check 'service is Running' { (Get-Service 'ai-memory').Status -eq 'Running' }
 
-    Check 'ai-memory status responds' {
+    Check 'ai-memory status reports a reachable server' {
         $o = Aim @('status') -AllowFail
-        $o -and $o.Length -gt 0
+        # any output at all used to pass this, including a failure message
+        ($script:NativeExit -eq 0) -and ($o -notmatch 'refused|unreachable|not running|error')
     }
 
     Check 'MCP endpoint reachable on loopback' {
