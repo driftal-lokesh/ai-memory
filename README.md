@@ -149,12 +149,41 @@ All of them point at the same URL, each with its own token:
 ## The network is open on purpose
 
 - Firewall accepts TCP 49374 from **any** source address.
-- Host-header allowlist defaults to `*` (`-AllowedHosts` narrows it).
 - Bind is `0.0.0.0`.
+- The Host allowlist is enumerated automatically.
 
-Any agent on any IP can connect. The bearer token is the access control — the
-server refuses unauthenticated non-loopback requests and will not start without
-a token, so it is not something that can be switched off.
+The bearer token is the access control — the server refuses unauthenticated
+non-loopback requests and will not start without a token, so it cannot be
+switched off.
+
+### The Host allowlist has no wildcard
+
+```rust
+fn host_allowed(host: &str, allowed_hosts: &[String]) -> bool {
+    allowed_hosts.iter().any(|allowed| {
+        host.eq_ignore_ascii_case(allowed)
+            || host_without_port(host).eq_ignore_ascii_case(allowed)
+    })
+}
+```
+
+Exact matching only. `*` is compared as a literal hostname, so setting it
+rejects **every** request with `403 forbidden host`.
+
+`-AllowedHosts auto` (the default) enumerates localhost, `127.0.0.1`, `::1`,
+every IPv4 and IPv6 address this machine owns, the WireGuard address, the
+machine name and its FQDN. The port is stripped before comparison, so bare
+names are enough.
+
+To add one by hand:
+
+```powershell
+.\setup.ps1 -AllowedHosts 'localhost,127.0.0.1,10.8.0.1,my-box.lan'
+```
+
+Setup verifies this with a real authenticated request after the service starts
+— the allowlist is enforced per request, so a healthy service proves nothing
+about it — and rebuilds the list once if it gets a 403.
 
 ## Security shape
 

@@ -31,7 +31,7 @@ param(
     [int]    $KeepBackups  = 14,
     [string] $UserName     = $env:USERNAME,
     [switch] $NoPause,
-    [string] $AllowedHosts = '*',
+    [string] $AllowedHosts = 'auto',
     [string[]] $KeyLabels  = @('lap-a', 'lap-b'),
     [string] $SecretsFile  = (Join-Path $env:USERPROFILE 'Desktop\ai-memory-secrets.txt')
 )
@@ -263,6 +263,90 @@ function Test-ServerAnswers {
         return $true
     }
     catch { return ((StatusOf $_) -ne 0) }
+}
+
+# Every Host header a client might send. There is NO wildcard -- from serve.rs:
+#
+#   fn host_allowed(host, allowed_hosts) -> bool {
+#       allowed_hosts.iter().any(|allowed| {
+#           host.eq_ignore_ascii_case(allowed)
+#               || host_without_port(host).eq_ignore_ascii_case(allowed)
+#       })
+#   }
+#
+# '*' is matched as a literal hostname, so setting it rejects everything with
+# 403 "forbidden host". The port is stripped before comparing, so bare names and
+# addresses are enough. Enumerate every address this machine actually has.
+function Build-AllowedHosts {
+    if ($AllowedHosts -and $AllowedHosts -ne 'auto' -and $AllowedHosts -ne '*') {
+        return $AllowedHosts
+    }
+    if ($AllowedHosts -eq '*') {
+        Warn "the server has no wildcard host matching; '*' would 403 every request. Enumerating instead."
+    }
+
+    $hosts = [System.Collections.Generic.List[string]]::new()
+    foreach ($h in @('localhost', '127.0.0.1', '::1', $env:COMPUTERNAME, "$WgSubnet.1")) {
+        if ($h) { $hosts.Add($h) }
+    }
+    # Every IP this host owns, so any interface an agent routes to is accepted.
+    # Guarded: Get-NetIPAddress is absent on older Windows and non-Windows, and
+    # -ErrorAction cannot suppress a command that does not exist.
+    if (Have 'Get-NetIPAddress') {
+        foreach ($ip in (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue)) {
+            if ($ip.IPAddress -and $ip.IPAddress -ne '127.0.0.1') { $hosts.Add($ip.IPAddress) }
+        }
+        foreach ($ip in (Get-NetIPAddress -AddressFamily IPv6 -ErrorAction SilentlyContinue)) {
+            if ($ip.IPAddress -and $ip.IPAddress -notmatch '^fe80|^::1') { $hosts.Add($ip.IPAddress) }
+        }
+    }
+    if ($script:LanIp) { $hosts.Add($script:LanIp) }
+    try {
+        $fqdn = [System.Net.Dns]::GetHostEntry($env:COMPUTERNAME).HostName
+        if ($fqdn) { $hosts.Add($fqdn) }
+    }
+    catch { }
+
+    return (($hosts | Where-Object { $_ } | Sort-Object -Unique) -join ',')
+}
+
+# Rewrite just the allowlist env var in the service XML, in place.
+function Set-AllowedHostsInXml ($xmlPath, $value) {
+    $script:AllowedHosts = $value
+    $xml = (Get-Content $xmlPath -Raw) -replace
+        '(<env name="AI_MEMORY_ALLOWED_HOSTS" value=")[^"]*(")', "`${1}$value`${2}"
+    Set-Content $xmlPath -Value $xml -Encoding UTF8
+    Say "    Host allowlist -> $value"
+}
+
+# The Host allowlist is enforced per request, so the service starts happily and
+# then 403s everything. Prove a real authenticated request gets through; if it
+# does not, rebuild the list and restart once.
+function Assert-HostAllowlist ($xmlPath, $winsw) {
+    for ($attempt = 0; $attempt -lt 2; $attempt++) {
+        $code = 0
+        try {
+            $r = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$Port/handoff" -TimeoutSec 10 `
+                -Headers @{ Authorization = "Bearer $($script:RootToken)" }
+            $code = [int]$r.StatusCode
+        }
+        catch { $code = StatusOf $_ }
+
+        if ($code -ne 403) {
+            Ok "Host allowlist accepts requests (got $code)"
+            return
+        }
+        if ($attempt -eq 1) { break }
+
+        Warn '403 forbidden host: the allowlist rejects this machine; rebuilding it'
+        Set-AllowedHostsInXml $xmlPath (Build-AllowedHosts)
+        Native { & $winsw stop } | Out-Null
+        Wait-PortFree
+        Native { & $winsw start } | Out-Null
+        [void](Wait-ServiceHealthy)
+    }
+    Warn "still 403 forbidden host. Current allowlist: $($script:AllowedHosts)"
+    Warn "add the exact Host your client sends: .\setup.ps1 -AllowedHosts '<host1>,<host2>'"
 }
 
 # The server's own last words, for matching failure signatures against.
@@ -627,8 +711,9 @@ function Step4-Service {
     # Host-header allowlist. Defaults to '*' so any hostname or IP an agent
     # uses is accepted. This guards against DNS rebinding only -- the bearer
     # token is what actually controls access.
-    $script:AllowedHosts = $AllowedHosts
+    $script:AllowedHosts = Build-AllowedHosts
     $allowed = $script:AllowedHosts
+    Ok "Host allowlist: $allowed"
 
     # Human auth is armed by a human user existing in config. Without
     # [auth].recovery_token the server exits on every start:
@@ -751,12 +836,7 @@ function Step4-Service {
            when = { param($log) $log -match 'allow|host' }
            fix  = {
                # if '*' is not an accepted value, fall back to naming everything
-               $script:AllowedHosts = @('localhost', '127.0.0.1', '::1', $script:LanIp,
-                   "$WgSubnet.1", $env:COMPUTERNAME) -join ','
-               $newXml = (Get-Content $xmlPath -Raw) -replace
-                   '(<env name="AI_MEMORY_ALLOWED_HOSTS" value=")[^"]*(")', "`${1}$($script:AllowedHosts)`${2}"
-               Set-Content $xmlPath -Value $newXml -Encoding UTF8
-               Say "    allowed hosts -> $($script:AllowedHosts)"
+               Set-AllowedHostsInXml $xmlPath (Build-AllowedHosts)
            } }
     )
 
@@ -786,6 +866,11 @@ function Step4-Service {
         Die "service did not start (status: $status)"
     }
     Ok 'service running (survives reboot)'
+
+    # The service can start cleanly and still reject every request with
+    # 403 "forbidden host" -- the Host allowlist is enforced per request, not at
+    # bind time, so a healthy service proves nothing about it.
+    Assert-HostAllowlist $xmlPath $winsw
 
     # --- never sleep -----------------------------------------------------
     Native { powercfg /change standby-timeout-ac 0 }   | Out-Null
@@ -902,7 +987,12 @@ function Step5-Test {
 
     Check 'unauthenticated request is rejected (401)' {
         try { Invoke-WebRequest -UseBasicParsing "$local/handoff" -TimeoutSec 10 | Out-Null; $false }
-        catch { (StatusOf $_) -eq 401 }
+        catch {
+            $c = StatusOf $_
+            # 403 here means the Host allowlist rejected it before auth ran
+            if ($c -eq 403) { Warn '  403 = forbidden host, not an auth result' }
+            $c -eq 401
+        }
     }
 
     Check 'authenticated request is accepted (200)' {

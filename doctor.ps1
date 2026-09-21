@@ -51,6 +51,21 @@ if ($conn) {
 }
 else { Detail 'nothing is listening' }
 
+Section 'host allowlist'
+$svcXml = Join-Path $DataDir 'service\ai-memory-service.xml'
+if (Test-Path $svcXml) {
+    $m = [regex]::Match((Get-Content $svcXml -Raw), '<env name="AI_MEMORY_ALLOWED_HOSTS" value="([^"]*)"')
+    if ($m.Success) {
+        Detail "configured: $($m.Groups[1].Value)"
+        if ($m.Groups[1].Value -match '\*') {
+            Write-Host "  '*' is NOT a wildcard here -- serve.rs matches host strings exactly," -ForegroundColor Red
+            Write-Host "  so this rejects every request with 403 forbidden host." -ForegroundColor Red
+        }
+    }
+    else { Detail 'AI_MEMORY_ALLOWED_HOSTS not set in the service XML' }
+}
+else { Detail "no service XML at $svcXml" }
+
 Section 'http'
 try {
     $r = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$Port/mcp" -TimeoutSec 5
@@ -86,6 +101,12 @@ if (Test-Path $errLog) {
         Detail "       human_mode cannot be switched off. Disabling users does NOT help."
         Detail "       Fix: secure_cookie = true in [auth]. Bearer auth never uses"
         Detail "       cookies, so it changes nothing for MCP clients."
+    }
+    if ($txt -match 'forbidden host' -or $txt -match 'disallowed Host header') {
+        Write-Host "  MATCH: the Host allowlist rejected a request (403)." -ForegroundColor Red
+        Detail "       serve.rs host_allowed() compares host strings exactly; there is"
+        Detail "       no wildcard. Re-run setup.ps1 (it enumerates every local address)"
+        Detail "       or pass the exact host: .\setup.ps1 -AllowedHosts '<host1>,<host2>'"
     }
     if ($txt -match 'token_pepper') {
         Write-Host "  MATCH: [auth].token_pepper is missing -- aim_ API keys need it." -ForegroundColor Red

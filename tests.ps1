@@ -337,10 +337,35 @@ T 'the recovery token is always written to config.toml' {
 T 'doctor never passes --enable-web either' {
     (Get-Content (Join-Path $PSScriptRoot 'doctor.ps1') -Raw) -notmatch 'enable-web'
 }
-T 'the Host allowlist defaults to open' {
+T 'the Host allowlist is enumerated, never a wildcard' {
+    # serve.rs host_allowed() does exact case-insensitive matching only, so '*'
+    # is treated as a literal hostname and 403s every request
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($src, [ref]$null, [ref]$null)
     $p = $ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'AllowedHosts' }
-    $p.DefaultValue.Extent.Text -eq "'*'"
+    ($p.DefaultValue.Extent.Text -eq "'auto'") -and
+    ((Get-Content $src -Raw) -match 'function Build-AllowedHosts')
+}
+T 'Build-AllowedHosts covers loopback, the tunnel IP and the machine name' {
+    $AllowedHosts = 'auto'; $WgSubnet = '10.8.0'
+    $r = Build-AllowedHosts
+    ($r -match 'localhost') -and ($r -match '127\.0\.0\.1') -and ($r -match '10\.8\.0\.1') -and
+    ($r -notmatch '\*')
+}
+T 'an explicit -AllowedHosts value is passed through untouched' {
+    $AllowedHosts = 'foo.example,10.9.9.9'
+    (Build-AllowedHosts) -eq 'foo.example,10.9.9.9'
+}
+T "a literal '*' is refused and enumerated instead" {
+    $AllowedHosts = '*'; $WgSubnet = '10.8.0'
+    $r = Build-AllowedHosts
+    ($r -notmatch '\*') -and ($r -match '127\.0\.0\.1')
+}
+T 'the allowlist is verified with a real request after the service starts' {
+    $code = Get-Content $src -Raw
+    # a healthy service proves nothing: the allowlist is enforced per request
+    ($code -match 'function Assert-HostAllowlist') -and
+    ($code -match 'Assert-HostAllowlist \$xmlPath \$winsw') -and
+    ($code -match 'function Set-AllowedHostsInXml')
 }
 T 'the firewall accepts any source address' {
     $code = Get-Content $src -Raw
