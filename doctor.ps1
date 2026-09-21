@@ -79,11 +79,13 @@ if (Test-Path $errLog) {
         Write-Host "  MATCH: something else already holds port $Port." -ForegroundColor Red
     }
     if ($txt -match 'refusing human authentication on non-loopback') {
-        Write-Host "  MATCH: a human user exists and the server binds non-loopback." -ForegroundColor Red
-        Detail "       Human login sends session cookies, which the server will not do"
-        Detail "       over plain HTTP off loopback. Binding wide is the point here."
-        Detail "       Fix: ai-memory user disable <name> --yes   (setup does this now)"
-        Detail "       There is no web UI in this setup, so nothing needs a password."
+        Write-Host "  MATCH: [auth].secure_cookie is not true." -ForegroundColor Red
+        Detail "       serve.rs: if human_mode && !secure_cookie { bail }"
+        Detail "       human_mode is armed by [auth].recovery_token, which is itself"
+        Detail "       mandatory ('no recoverable root user exists' without it), so"
+        Detail "       human_mode cannot be switched off. Disabling users does NOT help."
+        Detail "       Fix: secure_cookie = true in [auth]. Bearer auth never uses"
+        Detail "       cookies, so it changes nothing for MCP clients."
     }
     if ($txt -match 'token_pepper') {
         Write-Host "  MATCH: [auth].token_pepper is missing -- aim_ API keys need it." -ForegroundColor Red
@@ -105,8 +107,12 @@ if (Test-Path $cfg) {
         }
     }
     if (-not $any) { Detail 'no [auth] section' }
-    if ((Get-Content $cfg -Raw) -notmatch 'recovery_token') {
-        Write-Host "  recovery_token is NOT set -- this is what stops the server booting" -ForegroundColor Red
+    $raw = Get-Content $cfg -Raw
+    foreach ($k in @('recovery_token', 'token_pepper', 'bearer_token')) {
+        if ($raw -notmatch $k) { Write-Host "  $k is NOT set" -ForegroundColor Red }
+    }
+    if ($raw -notmatch 'secure_cookie\s*=\s*true') {
+        Write-Host "  secure_cookie is not true -- a non-loopback bind will refuse to start" -ForegroundColor Red
     }
 }
 else { Detail "no config.toml at $cfg" }

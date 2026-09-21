@@ -89,16 +89,39 @@ Leaving the passphrase only on this laptop defeats the point of the backups.
 3. **Set up Lap B.** Install WireGuard, import `lap-b.conf`, run the printed
    `install-mcp` line.
 
-## No web UI
+## The [auth] keys, and why each one is required
 
-The server will not serve human login on a non-loopback plain-HTTP address:
+From `crates/ai-memory-cli/src/commands/serve.rs`:
 
-> refusing human authentication on non-loopback plain HTTP address 0.0.0.0:49374:
-> passwords and session cookies require `[auth].secure_cookie=true` behind a
-> trusted HTTPS reverse proxy
+```rust
+fn human_auth_intended(auth, bootstrap_completed, any_password) -> bool {
+    bootstrap_completed || any_password
+        || secret_configured(auth.initial_root_password)
+        || secret_configured(auth.recovery_token)
+}
 
-Binding wide is the entire point, so setup disables human login and runs on
-machine credentials only. There is no browser UI and nothing needs a password.
+if human_mode && !secure_cookie { bail!("refusing human authentication on
+    non-loopback plain HTTP address ...") }
+```
+
+`recovery_token` is mandatory — without it the server exits with *"human
+authentication is enabled but no recoverable root user exists"*. But setting it
+is itself one of the four things that arms `human_mode`. So `human_mode` cannot
+be turned off, and disabling or deleting users does not help.
+
+That leaves exactly one way to bind non-loopback: `secure_cookie = true`. It
+only marks the `ai_memory_session` cookie `Secure`, and no MCP client uses
+cookies — they all send `Authorization: Bearer`, which "has precedence over
+every browser credential". So it costs nothing here.
+
+| key | why |
+|---|---|
+| `recovery_token` | else: no recoverable root user exists |
+| `token_pepper` | required for native `aim_` API keys |
+| `bearer_token` | root credential for admin calls and backups |
+| `secure_cookie = true` | else: refuses to bind non-loopback |
+
+There is no browser UI and nothing needs a password.
 
 ## Multiple agents
 

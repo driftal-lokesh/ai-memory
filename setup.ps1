@@ -307,7 +307,10 @@ function New-Secret {
 # absent. Deliberately line-based: the only keys written here are flat strings
 # in a known section, and pulling in a TOML parser for that is not worth it.
 function Set-TomlKey {
-    param([string] $Path, [string] $Section, [string] $Key, [string] $Value)
+    # -Raw writes the value unquoted, for TOML booleans and numbers. Quoting a
+    # boolean makes it a string and the server rejects the type.
+    param([string] $Path, [string] $Section, [string] $Key, [string] $Value, [switch] $Raw)
+    $rendered = if ($Raw) { $Value } else { "`"$Value`"" }
 
     $lines = if (Test-Path $Path) { @(Get-Content $Path) } else { @() }
     $out = [System.Collections.ArrayList]::new()
@@ -318,25 +321,25 @@ function Set-TomlKey {
     foreach ($line in $lines) {
         if ($line -match '^\s*\[(.+?)\]\s*$') {
             # leaving the target section without having written the key
-            if ($inSection -and -not $written) { [void]$out.Add("$Key = `"$Value`""); $written = $true }
+            if ($inSection -and -not $written) { [void]$out.Add("$Key = $rendered"); $written = $true }
             $inSection = ($matches[1] -eq $Section)
             if ($inSection) { $sectionSeen = $true }
             [void]$out.Add($line)
             continue
         }
         if ($inSection -and $line -match "^\s*$([regex]::Escape($Key))\s*=") {
-            [void]$out.Add("$Key = `"$Value`"")
+            [void]$out.Add("$Key = $rendered")
             $written = $true
             continue
         }
         [void]$out.Add($line)
     }
 
-    if ($inSection -and -not $written) { [void]$out.Add("$Key = `"$Value`""); $written = $true }
+    if ($inSection -and -not $written) { [void]$out.Add("$Key = $rendered"); $written = $true }
     if (-not $sectionSeen) {
         if ($out.Count -gt 0) { [void]$out.Add('') }
         [void]$out.Add("[$Section]")
-        [void]$out.Add("$Key = `"$Value`"")
+        [void]$out.Add("$Key = $rendered")
         $written = $true
     }
 
@@ -637,7 +640,29 @@ function Step4-Service {
     # required for native aim_ credentials
     [void](Set-TomlKey -Path $cfg -Section 'auth' -Key 'token_pepper' -Value (New-Secret (Join-Path $DataDir '.token-pepper')))
     [void](Set-TomlKey -Path $cfg -Section 'auth' -Key 'bearer_token' -Value $root)
-    Ok 'config.toml: [auth] recovery_token, token_pepper, bearer_token set'
+
+    # This is the one that unblocks a non-loopback bind. From serve.rs:
+    #
+    #   fn human_auth_intended(auth, bootstrap_completed, any_password) -> bool {
+    #       bootstrap_completed || any_password
+    #           || secret_configured(auth.initial_root_password)
+    #           || secret_configured(auth.recovery_token)        <-- armed by us
+    #   }
+    #   if human_mode && !secure_cookie { bail!("refusing human authentication
+    #       on non-loopback plain HTTP address ...") }
+    #
+    # recovery_token is mandatory (without it: "human authentication is enabled
+    # but no recoverable root user exists"), and setting it is itself one of the
+    # four things that arms human_mode. So human_mode cannot be turned off here,
+    # and secure_cookie=true is the only way past the exposure check.
+    #
+    # It costs nothing: it only marks the ai_memory_session cookie Secure, and
+    # no MCP client uses cookies -- they all send Authorization: Bearer, which
+    # "has precedence over every browser credential".
+    #
+    # Raw, because TOML booleans must not be quoted.
+    [void](Set-TomlKey -Path $cfg -Section 'auth' -Key 'secure_cookie' -Value 'true' -Raw)
+    Ok 'config.toml: [auth] recovery_token, token_pepper, bearer_token, secure_cookie=true'
     $webEnv = "`n  <env name=`"AI_MEMORY_AUTH__RECOVERY_TOKEN`" value=`"$($script:RecoveryToken)`"/>"
     # Absolute paths only -- the service runs as LocalSystem and would resolve
     # %LOCALAPPDATA% to a different profile.
@@ -662,7 +687,6 @@ function Step4-Service {
 </service>
 "@
 
-    Disable-HumanLogin
     $existing = Get-Service 'ai-memory' -ErrorAction SilentlyContinue
     $configChanged = -not (Test-Path $xmlPath) -or
                      ((Get-Content $xmlPath -Raw).Trim() -ne $xml.Trim())
@@ -714,11 +738,14 @@ function Step4-Service {
                }
                Wait-PortFree
            } },
-        @{ name = 'disable human login (it cannot serve off loopback over plain HTTP)'
-           when = { param($log) $log -match 'refusing human authentication|human authentication is enabled' }
+        @{ name = 'restore the [auth] keys a non-loopback bind requires'
+           when = { param($log) $log -match 'refusing human authentication|human authentication is enabled|token_pepper|bearer_token' }
            fix  = {
+               # human_mode is armed by recovery_token, which cannot be dropped,
+               # so secure_cookie is the only way past validate_http_exposure
                [void](Set-TomlKey -Path $cfg -Section 'auth' -Key 'recovery_token' -Value $script:RecoveryToken)
-               Disable-HumanLogin
+               [void](Set-TomlKey -Path $cfg -Section 'auth' -Key 'secure_cookie' -Value 'true' -Raw)
+               [void](Set-TomlKey -Path $cfg -Section 'auth' -Key 'bearer_token' -Value $script:RootToken)
            } },
         @{ name = 'narrow the Host allowlist from * to an explicit list'
            when = { param($log) $log -match 'allow|host' }
@@ -851,27 +878,6 @@ function Step4b-Backups {
     Ok 'daily 02:00 encrypted backup task registered'
 }
 
-# Human login is incompatible with a non-loopback plain-HTTP bind: the server
-# refuses to start rather than send session cookies in the clear. Binding wide
-# is the whole point here, and aim_ API keys need no human login, so any human
-# user gets its login disabled. Nothing here needs a password.
-function Disable-HumanLogin {
-    $out = Aim @('user', 'list') -EnvVars @{ AI_MEMORY_AUTH_TOKEN = $script:RootToken } -AllowFail
-    if ($script:NativeExit -ne 0) { return }
-
-    $names = @()
-    foreach ($line in ($out -split "`n")) {
-        if ($line -match '^\s*([A-Za-z0-9._-]+)\s' -and $line -notmatch 'username|^\s*-+\s*$|INFO|WARN') {
-            $names += $matches[1]
-        }
-    }
-    $names = $names | Sort-Object -Unique
-    foreach ($n in $names) {
-        $d = Aim @('user', 'disable', $n, '--yes') -EnvVars @{ AI_MEMORY_AUTH_TOKEN = $script:RootToken } -AllowFail
-        if ($script:NativeExit -eq 0) { Ok "human login disabled for '$n'" }
-    }
-    if (-not $names) { Info 'no human users to disable' }
-}
 
 # ------------------------------------------------------------------ step 5
 

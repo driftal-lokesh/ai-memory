@@ -423,6 +423,25 @@ T 'leaves unrelated sections untouched' {
     $r = TomlCase "[server]`nport = 49374`n`n[auth]`nbearer_token = `"abc`"`n`n[log]`nlevel = `"info`"`n"
     ($r -match 'port = 49374') -and ($r -match 'level = "info"') -and ($r -match 'bearer_token = "abc"')
 }
+T 'Raw writes an unquoted TOML boolean' {
+    $f = Join-Path ([System.IO.Path]::GetTempPath()) ("toml-" + [guid]::NewGuid().ToString('N') + ".toml")
+    [void](Set-TomlKey -Path $f -Section 'auth' -Key 'secure_cookie' -Value 'true' -Raw)
+    $r = Get-Content $f -Raw
+    Remove-Item $f -ErrorAction SilentlyContinue
+    # quoting a boolean makes it a string and the server rejects the type
+    ($r -match 'secure_cookie = true') -and ($r -notmatch 'secure_cookie = "true"')
+}
+T 'without Raw the value is still quoted' {
+    (TomlCase $null) -match 'recovery_token = "TOK123"'
+}
+T 'Raw replaces a quoted value in place' {
+    $f = Join-Path ([System.IO.Path]::GetTempPath()) ("toml-" + [guid]::NewGuid().ToString('N') + ".toml")
+    Set-Content $f -Value "[auth]`nsecure_cookie = `"false`"`n" -Encoding UTF8
+    [void](Set-TomlKey -Path $f -Section 'auth' -Key 'secure_cookie' -Value 'true' -Raw)
+    $r = Get-Content $f -Raw
+    Remove-Item $f -ErrorAction SilentlyContinue
+    ($r -match 'secure_cookie = true') -and ($r -notmatch 'false')
+}
 T 'setup writes recovery_token to config.toml, not just an env var' {
     $code = Get-Content $src -Raw
     ($code -match "Set-TomlKey -Path \`$cfg -Section 'auth' -Key 'recovery_token'")
@@ -431,13 +450,17 @@ T 'setup writes recovery_token to config.toml, not just an env var' {
 # --- 16. human auth vs a non-loopback bind --------------------------------
 # "refusing human authentication on non-loopback plain HTTP address
 #  0.0.0.0:49374" -- binding wide is the entire point, so human login goes.
-T 'human login is disabled before the service starts' {
+T 'secure_cookie=true is written -- the only way past validate_http_exposure' {
     $code = Get-Content $src -Raw
-    ($code -match 'function Disable-HumanLogin') -and
-    ($code -match "user', 'disable'") -and
-    ($code -match 'Disable-HumanLogin\s*\n\s*\$existing')
+    # serve.rs: if human_mode && !secure_cookie { bail }
+    # human_mode is armed by recovery_token, which is itself mandatory, so
+    # human_mode cannot be turned off and secure_cookie is the only exit.
+    ($code -match "Key 'secure_cookie' -Value 'true' -Raw")
 }
-T 'no human user is ever created without its login being disabled' {
+T 'the dead Disable-HumanLogin path is gone' {
+    (Get-Content $src -Raw) -notmatch 'Disable-HumanLogin'
+}
+T 'no human user is created unless the CLI forces it' {
     $code = Get-Content $src -Raw
     # api-key add needs a user row, so a non-human user is preferred; if only
     # add-human exists, the very next call must disable that login
