@@ -47,7 +47,8 @@ Already cloned? Just:
 | `-SkipDrive` | | Backups stay local instead of going to Google Drive. |
 | `-KeepBackups 14` | 14 | How many daily archives to retain. |
 | `-SecretsFile <path>` | `Desktop\ai-memory-secrets.txt` | Where the recovery sheet is written. |
-| `-EnableWeb` | off | Serve the browser UI. Off by default, and **incompatible with `-Reach Wireguard`/`Lan`**: the server refuses human login on a non-loopback plain-HTTP bind, because that would send session cookies in the clear. It needs an HTTPS reverse proxy. |
+| `-AllowedHosts '*'` | `*` | Host-header allowlist. Open by default. |
+| `-KeyLabels a,b,c` | `lap-a,lap-b` | One `aim_` API key per agent. |
 | `-Port 49374` | 49374 | ai-memory listen port. |
 | `-WgPort 51820` | 51820 | WireGuard UDP port (the one you forward). |
 
@@ -88,7 +89,7 @@ Leaving the passphrase only on this laptop defeats the point of the backups.
 3. **Set up Lap B.** Install WireGuard, import `lap-b.conf`, run the printed
    `install-mcp` line.
 
-## Why there is no web UI by default
+## No web UI
 
 The server will not serve human login on a non-loopback plain-HTTP address:
 
@@ -96,9 +97,41 @@ The server will not serve human login on a non-loopback plain-HTTP address:
 > passwords and session cookies require `[auth].secure_cookie=true` behind a
 > trusted HTTPS reverse proxy
 
-Binding wide is the entire point — Lap B has to reach it. So setup disables
-human login and runs on machine credentials only: `[auth].bearer_token` for
-admin operations and one `aim_` API key per laptop. Nothing needs a password.
+Binding wide is the entire point, so setup disables human login and runs on
+machine credentials only. There is no browser UI and nothing needs a password.
+
+## Multiple agents
+
+Every agent gets its own `aim_` key, so any one can be revoked without touching
+the others.
+
+```powershell
+.\setup.ps1 -KeyLabels lap-a,lap-b,cursor,codex,ci
+```
+
+```powershell
+ai-memory api-key add --username <you> --label <name>
+ai-memory api-key list
+ai-memory api-key revoke <id>
+```
+
+All of them point at the same URL, each with its own token:
+
+```json
+{ "mcpServers": { "ai-memory": {
+    "url": "http://10.8.0.1:49374/mcp",
+    "headers": { "Authorization": "Bearer aim_..." } } } }
+```
+
+## The network is open on purpose
+
+- Firewall accepts TCP 49374 from **any** source address.
+- Host-header allowlist defaults to `*` (`-AllowedHosts` narrows it).
+- Bind is `0.0.0.0`.
+
+Any agent on any IP can connect. The bearer token is the access control — the
+server refuses unauthenticated non-loopback requests and will not start without
+a token, so it is not something that can be switched off.
 
 ## Security shape
 
