@@ -312,7 +312,44 @@ T 'doctor.ps1 only reads -- it installs and changes nothing' {
     ($d -notmatch 'winget install|New-NetFirewallRule|Set-Content|Register-ScheduledTask|SetEnvironmentVariable')
 }
 
-# --- 14. MCP URL always carries the mandatory /mcp suffix ----------------
+# --- 14. the crash loop ---------------------------------------------------
+T '--enable-web is not passed by default' {
+    $code = Get-Content $src -Raw
+    # it arms human auth, which refuses to boot without a recovery token:
+    # "human authentication is enabled but no recoverable root user exists"
+    ($code -notmatch 'bind \$\(\$script:BindIp\):\$Port --enable-web') -and ($code -match '\$webArg')
+}
+T 'the recovery token is supplied unconditionally, not only with -EnableWeb' {
+    $code = Get-Content $src -Raw
+    # human auth can be armed by an existing human user, not just the flag
+    ($code -match 'AI_MEMORY_AUTH__RECOVERY_TOKEN') -and ($code -match '\.recovery-token') -and
+    ($code -match 'Setting it when it is not needed costs nothing')
+}
+T 'doctor runs the server without --enable-web' {
+    $d = Get-Content (Join-Path $PSScriptRoot 'doctor.ps1') -Raw
+    $d -notmatch 'bind 0\.0\.0\.0:\$Port --enable-web'
+}
+T 'doctor recognises the human-auth crash signature' {
+    (Get-Content (Join-Path $PSScriptRoot 'doctor.ps1') -Raw) -match 'no recoverable root user'
+}
+
+# no helper may shadow a built-in alias -- `H` silently resolved to Get-History
+# and swallowed every section header in doctor.ps1
+T 'no helper function shadows a built-in cmdlet or alias' {
+    $shadowed = @()
+    foreach ($f in @($src, (Join-Path $PSScriptRoot 'doctor.ps1'))) {
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($f, [ref]$null, [ref]$null)
+        foreach ($fn in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)) {
+            $existing = Get-Command $fn.Name -ErrorAction SilentlyContinue |
+                Where-Object { $_.CommandType -in 'Alias', 'Cmdlet' }
+            if ($existing) { $shadowed += "$($fn.Name) -> $($existing.CommandType)" }
+        }
+    }
+    if ($shadowed) { $shadowed | ForEach-Object { Write-Host "     $_" -ForegroundColor DarkGray } }
+    $shadowed.Count -eq 0
+}
+
+# --- 15. MCP URL always carries the mandatory /mcp suffix ----------------
 T 'every printed MCP url ends in /mcp' {
     $txt = Get-Content $src -Raw
     $urls = [regex]::Matches($txt, 'http://\$\([^)]+\):\$Port(/mcp)?') | ForEach-Object { $_.Value }

@@ -31,6 +31,7 @@ param(
     [int]    $KeepBackups  = 14,
     [string] $UserName     = $env:USERNAME,
     [switch] $NoPause,
+    [switch] $EnableWeb,
     [string] $SecretsFile  = (Join-Path $env:USERPROFILE 'Desktop\ai-memory-secrets.txt')
 )
 
@@ -205,7 +206,8 @@ function Test-ServeDirectly {
     Remove-Item $o, $e -ErrorAction SilentlyContinue
 
     $env:AI_MEMORY_AUTH_TOKEN = $script:RootToken
-    $serveArgs = "--data-dir `"$DataDir`" serve --transport http --bind $($script:BindIp):$Port --enable-web"
+    if ($script:RecoveryToken) { $env:AI_MEMORY_AUTH__RECOVERY_TOKEN = $script:RecoveryToken }
+    $serveArgs = "--data-dir `"$DataDir`" serve --transport http --bind $($script:BindIp):$Port$(if ($EnableWeb) { ' --enable-web' })"
     Say ""
     Write-Host "  ---- running the server directly for 6s ----" -ForegroundColor Yellow
     Say "  $Exe $serveArgs"
@@ -551,6 +553,28 @@ function Step4-Service {
     }
 
     $allowed = @($script:McpHost, 'localhost', '127.0.0.1', $script:LanIp) -join ','
+
+    # --enable-web switches on human authentication, and human auth refuses to
+    # boot without a recoverable root user or [auth].recovery_token. The MCP
+    # server itself needs neither, so the web UI is opt-in and brings its own
+    # recovery token when asked for.
+    # The recovery token is always supplied. Human auth can be armed by the
+    # --enable-web flag OR by a human user already existing in config, and
+    # without a recovery token the server refuses to boot at all:
+    #   "human authentication is enabled but no recoverable root user exists"
+    # Setting it when it is not needed costs nothing; not setting it is a
+    # crash loop.
+    $recFile = Join-Path $DataDir '.recovery-token'
+    if (Test-Path $recFile) { $script:RecoveryToken = (Get-Content $recFile -Raw).Trim() }
+    else {
+        $rb = [byte[]]::new(32)
+        [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($rb)
+        $script:RecoveryToken = [Convert]::ToBase64String($rb).TrimEnd('=')
+        $script:RecoveryToken | Set-Content $recFile -Encoding ASCII
+        (Get-Item $recFile).Attributes = 'Hidden'
+    }
+    $webEnv = "`n  <env name=`"AI_MEMORY_AUTH__RECOVERY_TOKEN`" value=`"$($script:RecoveryToken)`"/>"
+    $webArg = if ($EnableWeb) { ' --enable-web' } else { '' }
     # Absolute paths only -- the service runs as LocalSystem and would resolve
     # %LOCALAPPDATA% to a different profile.
     $xmlPath = Join-Path $SvcDir 'ai-memory-service.xml'
@@ -560,7 +584,7 @@ function Step4-Service {
   <name>ai-memory MCP server</name>
   <description>Local long-term memory server for AI coding agents</description>
   <executable>$Exe</executable>
-  <arguments>--data-dir "$DataDir" serve --transport http --bind $($script:BindIp):$Port --enable-web</arguments>
+  <arguments>--data-dir "$DataDir" serve --transport http --bind $($script:BindIp):$Port$webArg</arguments>
   <startmode>Automatic</startmode>
   <onfailure action="restart" delay="5 sec"/>
   <onfailure action="restart" delay="10 sec"/>
@@ -570,7 +594,7 @@ function Step4-Service {
   <logpath>$DataDir\logs</logpath>
   <env name="AI_MEMORY_AUTH_TOKEN" value="$root"/>
   <env name="AI_MEMORY_ALLOWED_HOSTS" value="$allowed"/>
-  <env name="AI_MEMORY_DATA_DIR" value="$DataDir"/>
+  <env name="AI_MEMORY_DATA_DIR" value="$DataDir"/>$webEnv
 </service>
 "@
 
@@ -652,8 +676,19 @@ function Step4-Service {
         Ok 'reusing existing API keys'
     }
     else {
-        $u = Aim @('user', 'add-human', '--username', $UserName, '--email', "$UserName@local", '--name', $UserName) `
-            -EnvVars @{ AI_MEMORY_AUTH_TOKEN = $root } -AllowFail
+        # only needed for the web UI; api-key add requires the user to exist
+        $u = if ($EnableWeb) {
+            Aim @('user', 'add-human', '--username', $UserName, '--email', "$UserName@local", '--name', $UserName) `
+                -EnvVars @{ AI_MEMORY_AUTH_TOKEN = $root } -AllowFail
+        }
+        else {
+            Aim @('user', 'add', '--username', $UserName) -EnvVars @{ AI_MEMORY_AUTH_TOKEN = $root } -AllowFail
+            if ($script:NativeExit -ne 0) {
+                # older builds only expose add-human; fall back to it
+                Aim @('user', 'add-human', '--username', $UserName, '--email', "$UserName@local", '--name', $UserName) `
+                    -EnvVars @{ AI_MEMORY_AUTH_TOKEN = $root } -AllowFail
+            }
+        }
         if ($u -match 'password') {
             # the raw output carries ai-memory's stderr banner and PowerShell's
             # NativeCommandError decoration; keep only the credential
@@ -870,7 +905,8 @@ function Write-Secrets {
     A "  data       $DataDir"
     A "  backups    $($script:BackupDest)"
     A "  repo       $RepoRoot"
-    A "  web UI     http://127.0.0.1:$Port"
+    if ($EnableWeb) { A "  web UI     http://127.0.0.1:$Port" }
+    if ($script:RecoveryToken) { A "  recovery   $($script:RecoveryToken)" }
     A ""
 
     Set-Content -Path $SecretsFile -Value $sb.ToString() -Encoding UTF8
@@ -960,7 +996,7 @@ function Step6-Report {
 
     Write-Host "  ---------------- REFERENCE ----------------" -ForegroundColor Cyan
     Say ""
-    Say "    Web UI          http://127.0.0.1:$Port"
+    if ($EnableWeb) { Say "    Web UI          http://127.0.0.1:$Port" }
     Say "    Data            $DataDir"
     Say "    Backups         $($script:BackupDest)   (daily 02:00, keep $KeepBackups)"
     Say "    Service         Get-Service ai-memory   /   Restart-Service ai-memory"

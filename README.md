@@ -47,6 +47,7 @@ Already cloned? Just:
 | `-SkipDrive` | | Backups stay local instead of going to Google Drive. |
 | `-KeepBackups 14` | 14 | How many daily archives to retain. |
 | `-SecretsFile <path>` | `Desktop\ai-memory-secrets.txt` | Where the recovery sheet is written. |
+| `-EnableWeb` | off | Serve the browser UI. Off by default: it arms human authentication, which the MCP server does not need. |
 | `-Port 49374` | 49374 | ai-memory listen port. |
 | `-WgPort 51820` | 51820 | WireGuard UDP port (the one you forward). |
 
@@ -156,6 +157,7 @@ reason printed above).
 | `restore` refuses to run | Another ai-memory process is alive. `Stop-Service ai-memory` first. |
 | Lap A rebooted, server gone | It shouldn't. `Get-Service ai-memory`. Never start the server from a Scheduled Task — it is silently killed at the next reboot. |
 | `winget` not found | Install "App Installer" from the Microsoft Store |
+| Service restarts forever ("terminated unexpectedly, N time(s)") | Run `.\doctor.ps1` — it matches known crash signatures. The usual one is human auth armed without a recovery token; setup supplies one now. |
 | The window vanished | It shouldn't any more, but the full transcript is at `%TEMP%\ai-memory-setup-*.log` |
 | Native command "crashes" the script | Every native call goes through the `Native` wrapper. If you add one, wrap it — see the comment above `function Native` in setup.ps1. |
 | "python is not usable yet in this window" | Windows won't expose a just-installed python to an already-open shell. Close it, open a new admin PowerShell, re-run. |
