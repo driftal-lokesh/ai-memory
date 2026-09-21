@@ -349,7 +349,54 @@ T 'no helper function shadows a built-in cmdlet or alias' {
     $shadowed.Count -eq 0
 }
 
-# --- 15. MCP URL always carries the mandatory /mcp suffix ----------------
+# --- 15. Set-TomlKey ------------------------------------------------------
+# The server exits on every start without [auth].recovery_token, so this writer
+# has to be right on a config file it did not create.
+function TomlCase ($content) {
+    $f = Join-Path ([System.IO.Path]::GetTempPath()) ("toml-" + [guid]::NewGuid().ToString('N') + ".toml")
+    if ($null -ne $content) { Set-Content $f -Value $content -Encoding UTF8 }
+    [void](Set-TomlKey -Path $f -Section 'auth' -Key 'recovery_token' -Value 'TOK123')
+    $out = Get-Content $f -Raw
+    Remove-Item $f -ErrorAction SilentlyContinue
+    return $out
+}
+
+T 'creates the section and key in a file that does not exist' {
+    $r = TomlCase $null
+    ($r -match '(?m)^\[auth\]') -and ($r -match 'recovery_token = "TOK123"')
+}
+T 'appends the section to a file that has other sections' {
+    $r = TomlCase "[server]`nport = 49374`n"
+    ($r -match '(?m)^\[server\]') -and ($r -match 'port = 49374') -and
+    ($r -match '(?m)^\[auth\]') -and ($r -match 'recovery_token = "TOK123"')
+}
+T 'inserts into an existing [auth] section' {
+    $r = TomlCase "[auth]`nbearer_token = `"abc`"`n"
+    ($r -match 'bearer_token = "abc"') -and ($r -match 'recovery_token = "TOK123"') -and
+    (([regex]::Matches($r, '\[auth\]')).Count -eq 1)
+}
+T 'replaces an existing value rather than duplicating it' {
+    $r = TomlCase "[auth]`nrecovery_token = `"OLD`"`nbearer_token = `"abc`"`n"
+    ($r -notmatch 'OLD') -and ($r -match 'recovery_token = "TOK123"') -and
+    (([regex]::Matches($r, 'recovery_token')).Count -eq 1)
+}
+T 'writes into [auth] and not into a later section' {
+    $r = TomlCase "[auth]`nbearer_token = `"abc`"`n`n[server]`nport = 49374`n"
+    $authIdx = $r.IndexOf('[auth]')
+    $srvIdx  = $r.IndexOf('[server]')
+    $keyIdx  = $r.IndexOf('recovery_token')
+    ($keyIdx -gt $authIdx) -and ($keyIdx -lt $srvIdx)
+}
+T 'leaves unrelated sections untouched' {
+    $r = TomlCase "[server]`nport = 49374`n`n[auth]`nbearer_token = `"abc`"`n`n[log]`nlevel = `"info`"`n"
+    ($r -match 'port = 49374') -and ($r -match 'level = "info"') -and ($r -match 'bearer_token = "abc"')
+}
+T 'setup writes recovery_token to config.toml, not just an env var' {
+    $code = Get-Content $src -Raw
+    ($code -match "Set-TomlKey -Path \`$cfg -Section 'auth' -Key 'recovery_token'")
+}
+
+# --- 16. MCP URL always carries the mandatory /mcp suffix ----------------
 T 'every printed MCP url ends in /mcp' {
     $txt = Get-Content $src -Raw
     $urls = [regex]::Matches($txt, 'http://\$\([^)]+\):\$Port(/mcp)?') | ForEach-Object { $_.Value }

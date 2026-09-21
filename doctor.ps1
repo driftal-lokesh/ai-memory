@@ -68,9 +68,10 @@ $errLog = Join-Path $DataDir 'logs\ai-memory-service.err.log'
 if (Test-Path $errLog) {
     $txt = Get-Content $errLog -Raw
     if ($txt -match 'human authentication is enabled but no recoverable root user') {
-        Write-Host "  MATCH: --enable-web armed human auth with no recovery token." -ForegroundColor Red
-        Detail "       Fix: re-run setup.ps1 without -EnableWeb (the default now),"
-        Detail "       or with -EnableWeb so it supplies a recovery token."
+        Write-Host "  MATCH: human auth is armed and [auth].recovery_token is missing." -ForegroundColor Red
+        Detail "       Armed by a human user existing in config -- NOT by --enable-web,"
+        Detail "       so dropping that flag does not help."
+        Detail "       Fix: re-run setup.ps1; it writes [auth].recovery_token to config.toml."
     }
     if ($txt -match 'single-instance serve lock') {
         Detail "note: a serve lock exists at $DataDir\.serve.lock (normal while running)"
@@ -80,6 +81,26 @@ if (Test-Path $errLog) {
     }
 }
 else { Detail 'no error log yet' }
+
+Section 'config.toml [auth]'
+$cfg = Join-Path $DataDir 'config.toml'
+if (Test-Path $cfg) {
+    $inAuth = $false
+    $any = $false
+    foreach ($line in (Get-Content $cfg)) {
+        if ($line -match '^\s*\[(.+?)\]\s*$') { $inAuth = ($matches[1] -eq 'auth'); if ($inAuth) { Detail $line; $any = $true }; continue }
+        if ($inAuth -and $line.Trim()) {
+            # never print the secrets themselves, only whether they are set
+            Detail ($line -replace '=\s*".*"', '= "<set>"')
+            $any = $true
+        }
+    }
+    if (-not $any) { Detail 'no [auth] section' }
+    if ((Get-Content $cfg -Raw) -notmatch 'recovery_token') {
+        Write-Host "  recovery_token is NOT set -- this is what stops the server booting" -ForegroundColor Red
+    }
+}
+else { Detail "no config.toml at $cfg" }
 
 Section 'logs'
 $logs = Join-Path $DataDir 'logs'
@@ -130,7 +151,7 @@ else {
         }
         Write-Host ""
         if ($alive) { Write-Host "  VERDICT: the server runs fine directly. The fault is the service wrapper." -ForegroundColor Green }
-        else { Write-Host "  VERDICT: the server exited by itself (code $($proc.ExitCode)). Reason above." -ForegroundColor Yellow }
+        else { Write-Host "  VERDICT: the server exited by itself (code $(if ($null -ne $code) { $code } else { 'unknown' })). Reason above." -ForegroundColor Yellow }
     }
     catch { Detail "could not launch: $($_.Exception.Message)" }
 }

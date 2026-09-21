@@ -221,6 +221,8 @@ function Test-ServeDirectly {
     Start-Sleep 6
     $alive = -not $proc.HasExited
     if ($alive) { try { $proc.Kill() } catch { } }
+    try { $proc.WaitForExit(2000) | Out-Null } catch { }
+    $code = try { $proc.ExitCode } catch { $null }
 
     foreach ($f in @($e, $o)) {
         if ((Test-Path $f) -and (Get-Item $f).Length -gt 0) {
@@ -233,7 +235,7 @@ function Test-ServeDirectly {
         Write-Host "  not ai-memory or your config." -ForegroundColor Yellow
     }
     else {
-        Write-Host "  The server exited on its own (code $($proc.ExitCode)). The reason is above." -ForegroundColor Yellow
+        Write-Host "  The server exited on its own (code $(if ($null -ne $code) { $code } else { 'unknown' })). The reason is above." -ForegroundColor Yellow
     }
     Say ""
 }
@@ -275,6 +277,47 @@ function Show-ServerLogs {
         $tail | ForEach-Object { Say "  $_" }
     }
     Say ""
+}
+
+# Sets key = "value" inside [section] of a TOML file, creating either if
+# absent. Deliberately line-based: the only keys written here are flat strings
+# in a known section, and pulling in a TOML parser for that is not worth it.
+function Set-TomlKey {
+    param([string] $Path, [string] $Section, [string] $Key, [string] $Value)
+
+    $lines = if (Test-Path $Path) { @(Get-Content $Path) } else { @() }
+    $out = [System.Collections.ArrayList]::new()
+    $inSection = $false
+    $written = $false
+    $sectionSeen = $false
+
+    foreach ($line in $lines) {
+        if ($line -match '^\s*\[(.+?)\]\s*$') {
+            # leaving the target section without having written the key
+            if ($inSection -and -not $written) { [void]$out.Add("$Key = `"$Value`""); $written = $true }
+            $inSection = ($matches[1] -eq $Section)
+            if ($inSection) { $sectionSeen = $true }
+            [void]$out.Add($line)
+            continue
+        }
+        if ($inSection -and $line -match "^\s*$([regex]::Escape($Key))\s*=") {
+            [void]$out.Add("$Key = `"$Value`"")
+            $written = $true
+            continue
+        }
+        [void]$out.Add($line)
+    }
+
+    if ($inSection -and -not $written) { [void]$out.Add("$Key = `"$Value`""); $written = $true }
+    if (-not $sectionSeen) {
+        if ($out.Count -gt 0) { [void]$out.Add('') }
+        [void]$out.Add("[$Section]")
+        [void]$out.Add("$Key = `"$Value`"")
+        $written = $true
+    }
+
+    Set-Content -Path $Path -Value ($out -join "`r`n") -Encoding UTF8
+    return $written
 }
 
 # ------------------------------------------------------------------ step 0
@@ -573,6 +616,13 @@ function Step4-Service {
         $script:RecoveryToken | Set-Content $recFile -Encoding ASCII
         (Get-Item $recFile).Attributes = 'Hidden'
     }
+    # Human auth is armed by config -- a human user existing is enough, the
+    # --enable-web flag is not required. Without [auth].recovery_token the
+    # server exits on every start. The error names this key exactly, so write
+    # it to config.toml rather than guessing at an environment variable.
+    $cfg = Join-Path $DataDir 'config.toml'
+    [void](Set-TomlKey -Path $cfg -Section 'auth' -Key 'recovery_token' -Value $script:RecoveryToken)
+    Ok 'config.toml: [auth].recovery_token set'
     $webEnv = "`n  <env name=`"AI_MEMORY_AUTH__RECOVERY_TOKEN`" value=`"$($script:RecoveryToken)`"/>"
     $webArg = if ($EnableWeb) { ' --enable-web' } else { '' }
     # Absolute paths only -- the service runs as LocalSystem and would resolve
