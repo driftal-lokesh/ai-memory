@@ -68,6 +68,15 @@ function Refresh-Path {
 
 function Have ($cmd) { [bool](Get-Command $cmd -ErrorAction SilentlyContinue) }
 
+# Invoke-WebRequest raises WebException on PowerShell 5.1 and
+# HttpResponseException on 7, and the status code hangs off a different property
+# on each. Normalise. 0 means no HTTP response at all: refused, DNS, or timeout.
+function StatusOf ($errorRecord) {
+    $r = $errorRecord.Exception.Response
+    if ($null -eq $r) { return 0 }
+    try { return [int]$r.StatusCode } catch { return 0 }
+}
+
 function Winget-Install ($id, $label) {
     Info "$label ($id)"
     $out = winget install --id $id --silent --accept-package-agreements --accept-source-agreements 2>&1 | Out-String
@@ -81,13 +90,13 @@ function Winget-Install ($id, $label) {
 # Runs ai-memory and returns stdout. Dies with the raw output on failure so the
 # real error is visible instead of an empty exception.
 function Aim {
-    param([string[]] $Args, [hashtable] $Env = @{}, [switch] $AllowFail)
+    param([string[]] $CliArgs, [hashtable] $EnvVars = @{}, [switch] $AllowFail)
     $old = @{}
-    foreach ($k in $Env.Keys) { $old[$k] = [Environment]::GetEnvironmentVariable($k); Set-Item "env:$k" $Env[$k] }
+    foreach ($k in $EnvVars.Keys) { $old[$k] = [Environment]::GetEnvironmentVariable($k); Set-Item "env:$k" $EnvVars[$k] }
     try {
-        $out = & $Exe @Args 2>&1 | Out-String
+        $out = & $Exe @CliArgs 2>&1 | Out-String
         if ($LASTEXITCODE -ne 0 -and -not $AllowFail) {
-            Die "ai-memory $($Args -join ' ') exited $LASTEXITCODE`n$out"
+            Die "ai-memory $($CliArgs -join ' ') exited $LASTEXITCODE`n$out"
         }
         return $out
     }
@@ -398,12 +407,12 @@ function Step4-Service {
     }
     else {
         $u = Aim @('user', 'add-human', '--username', $UserName, '--email', "$UserName@local", '--name', $UserName) `
-            -Env @{ AI_MEMORY_AUTH_TOKEN = $root } -AllowFail
+            -EnvVars @{ AI_MEMORY_AUTH_TOKEN = $root } -AllowFail
         if ($u -match 'password') { Note "Web UI login for '$UserName' -- temp password from setup:`n$($u.Trim())" }
 
         $keys = @{}
         foreach ($label in @('lap-a', 'lap-b')) {
-            $o = Aim @('api-key', 'add', '--username', $UserName, '--label', $label) -Env @{ AI_MEMORY_AUTH_TOKEN = $root }
+            $o = Aim @('api-key', 'add', '--username', $UserName, '--label', $label) -EnvVars @{ AI_MEMORY_AUTH_TOKEN = $root }
             $k = ($o -split "`n" | Where-Object { $_.Trim() -match '^aim_' } | Select-Object -First 1)
             if (-not $k) { Die "could not parse an aim_ key for $label. Raw output:`n$o" }
             $keys[$label] = $k.Trim()
@@ -473,12 +482,12 @@ function Step5-Test {
 
     Check 'MCP endpoint reachable on loopback' {
         try { Invoke-WebRequest -UseBasicParsing "$local/mcp" -TimeoutSec 10 | Out-Null; $true }
-        catch { $_.Exception.Response.StatusCode.value__ -in 400, 401, 405, 406 }
+        catch { (StatusOf $_) -in 400, 401, 403, 405, 406 }
     }
 
     Check 'unauthenticated request is rejected (401)' {
         try { Invoke-WebRequest -UseBasicParsing "$local/handoff" -TimeoutSec 10 | Out-Null; $false }
-        catch { $_.Exception.Response.StatusCode.value__ -eq 401 }
+        catch { (StatusOf $_) -eq 401 }
     }
 
     Check 'authenticated request is accepted (200)' {
@@ -492,7 +501,7 @@ function Step5-Test {
         }
         Check "server answers on tunnel address $($script:McpHost)" {
             try { Invoke-WebRequest -UseBasicParsing "http://$($script:McpHost):$Port/mcp" -TimeoutSec 10 | Out-Null; $true }
-            catch { $_.Exception.Response.StatusCode.value__ -in 400, 401, 405, 406 }
+            catch { (StatusOf $_) -in 400, 401, 403, 405, 406 }
         }
     }
 
@@ -536,7 +545,7 @@ function Step6-Report {
     Say '    "mcpServers": {'
     Say '      "ai-memory": {'
     Say "        `"url`": `"$url`","
-    Say '        "headers": { "Authorization": "Bearer ' + $script:Keys.'lap-b' + '" }'
+    Say ('        "headers": { "Authorization": "Bearer ' + $script:Keys.'lap-b' + '" }')
     Say '      }'
     Say '    }'
     Say '  }'
