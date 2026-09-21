@@ -27,8 +27,7 @@ Lap B ── Claude Code ── http://10.8.0.1:49374/mcp
 On Lap A, in any PowerShell:
 
 ```powershell
-$env:AI_MEMORY_OPS_REPO = 'https://github.com/YOU/ai-memory.git'
-irm https://raw.githubusercontent.com/YOU/ai-memory/main/bootstrap.ps1 | iex
+irm https://raw.githubusercontent.com/driftal-lokesh/ai-memory/main/bootstrap.ps1 | iex
 ```
 
 It elevates itself, installs git, clones to `C:\ai-memory-ops`, and runs `setup.ps1`.
@@ -101,6 +100,7 @@ python memory_backup.py verify     # restore newest into a temp dir and assert i
 python memory_backup.py prune      # enforce retention only
 python memory_backup.py restore    # DANGER: overwrites live data. Stop-Service ai-memory first.
 python test_backup.py              # crypto self-check
+pwsh -File tests.ps1               # offline checks for setup.ps1
 ```
 
 Retention is enforced by deleting files. There is no incremental backup — if
@@ -133,5 +133,6 @@ bootstrap.ps1       one-line entry: elevate, install git, clone, run setup
 setup.ps1           steps 0-6
 memory_backup.py    backup / restore / verify / prune, AES-256-GCM
 test_backup.py      crypto self-check (no framework, just asserts)
+tests.ps1           offline checks for setup.ps1 (AST-loads its functions, runs nothing)
 lap-b.conf          generated; gitignored; holds a private key
 ```

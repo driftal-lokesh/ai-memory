@@ -5,22 +5,18 @@
 .DESCRIPTION
   Run this from any PowerShell on Lap A:
 
-    irm https://raw.githubusercontent.com/<you>/ai-memory/main/bootstrap.ps1 | iex
+    irm https://raw.githubusercontent.com/driftal-lokesh/ai-memory/main/bootstrap.ps1 | iex
 
-  Set $env:AI_MEMORY_OPS_REPO first if your fork lives elsewhere.
+  Defaults to driftal-lokesh/ai-memory. Set $env:AI_MEMORY_OPS_REPO to override.
 #>
 [CmdletBinding()]
 param(
-    [string] $RepoUrl = $(if ($env:AI_MEMORY_OPS_REPO) { $env:AI_MEMORY_OPS_REPO } else { 'https://github.com/REPLACE-ME/ai-memory.git' }),
+    [string] $RepoUrl = $(if ($env:AI_MEMORY_OPS_REPO) { $env:AI_MEMORY_OPS_REPO } else { 'https://github.com/driftal-lokesh/ai-memory.git' }),
     [string] $Dest    = 'C:\ai-memory-ops',
     [ValidateSet('Wireguard', 'Lan')] [string] $Reach = 'Wireguard'
 )
 
 $ErrorActionPreference = 'Stop'
-
-if ($RepoUrl -match 'REPLACE-ME') {
-    throw "Set the repo URL first: `$env:AI_MEMORY_OPS_REPO = 'https://github.com/you/ai-memory.git'"
-}
 
 # --- elevate ---------------------------------------------------------------
 $id = [Security.Principal.WindowsIdentity]::GetCurrent()

@@ -266,7 +266,8 @@ function Set-Fw ($name, $proto, $port, $remote) {
 
 function Get-PublicIp {
     foreach ($u in @('https://api.ipify.org', 'https://ifconfig.me/ip', 'https://icanhazip.com')) {
-        try { return (Invoke-RestMethod -Uri $u -TimeoutSec 8).ToString().Trim() } catch { }
+        # any one of these can be down or blocked; try the next one silently
+        try { return (Invoke-RestMethod -Uri $u -TimeoutSec 8).ToString().Trim() } catch { continue }
     }
     Warn 'could not detect public IP -- lap-b.conf Endpoint needs filling in by hand'
     return 'YOUR.PUBLIC.IP.HERE'
