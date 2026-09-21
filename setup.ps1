@@ -31,7 +31,8 @@ param(
     [int]    $KeepBackups  = 14,
     [string] $UserName     = $env:USERNAME,
     [switch] $NoPause,
-    [switch] $EnableWeb,
+    [string] $AllowedHosts = '*',
+    [string[]] $KeyLabels  = @('lap-a', 'lap-b'),
     [string] $SecretsFile  = (Join-Path $env:USERPROFILE 'Desktop\ai-memory-secrets.txt')
 )
 
@@ -208,7 +209,7 @@ function Test-ServeDirectly {
     $env:AI_MEMORY_AUTH_TOKEN = $script:RootToken
     if ($script:RecoveryToken) { $env:AI_MEMORY_AUTH__RECOVERY_TOKEN = $script:RecoveryToken }
     if ($script:AllowedHosts) { $env:AI_MEMORY_ALLOWED_HOSTS = $script:AllowedHosts }
-    $serveArgs = "--data-dir `"$DataDir`" serve --transport http --bind $($script:BindIp):$Port$(if ($EnableWeb) { ' --enable-web' })"
+    $serveArgs = "--data-dir `"$DataDir`" serve --transport http --bind $($script:BindIp):$Port"
     Say ""
     Write-Host "  ---- running the server directly for 6s ----" -ForegroundColor Yellow
     Say "  $Exe $serveArgs"
@@ -262,6 +263,13 @@ function Test-ServerAnswers {
         return $true
     }
     catch { return ((StatusOf $_) -ne 0) }
+}
+
+# The server's own last words, for matching failure signatures against.
+function Read-ErrLog {
+    $f = Join-Path $DataDir 'logs\ai-memory-service.err.log'
+    if (-not (Test-Path $f)) { return '' }
+    return ((Get-Content $f -Tail 40 -ErrorAction SilentlyContinue) -join "`n")
 }
 
 # Telling someone to go read a log file is not an error message. Print it.
@@ -429,8 +437,8 @@ function Step2-Network {
         $script:BindIp = $lan
         $script:McpHost = $lan
         $prefix = ($lan -split '\.')[0..2] -join '.'
-        Set-Fw 'ai-memory MCP (LAN)' 'TCP' $Port "$prefix.0/24"
-        Note "Lap B must be on this same Wi-Fi to reach $lan."
+        Set-Fw 'ai-memory MCP' 'TCP' $Port 'Any'
+        Note "Clients must be on this same Wi-Fi to reach $lan."
         return
     }
 
@@ -490,7 +498,9 @@ PersistentKeepalive = 25
     }
 
     Set-Fw 'ai-memory WireGuard' 'UDP' $WgPort 'Any'
-    Set-Fw 'ai-memory MCP (tunnel only)' 'TCP' $Port "$WgSubnet.0/24"
+    # Open to any source address, not just the tunnel subnet: agents connect
+    # from the LAN and over WireGuard. The bearer token is the access control.
+    Set-Fw 'ai-memory MCP' 'TCP' $Port 'Any'
 
     $svc = Get-Service 'WireGuardTunnel$ai-memory-wg0' -ErrorAction SilentlyContinue
     if ($svc) { Ok 'WireGuard tunnel service already installed' }
@@ -611,24 +621,17 @@ function Step4-Service {
         Unblock-File $winsw
     }
 
-    $allowed = @($script:McpHost, 'localhost', '127.0.0.1', '::1', $script:LanIp) -join ','
-    $script:AllowedHosts = $allowed
+    # Host-header allowlist. Defaults to '*' so any hostname or IP an agent
+    # uses is accepted. This guards against DNS rebinding only -- the bearer
+    # token is what actually controls access.
+    $script:AllowedHosts = $AllowedHosts
+    $allowed = $script:AllowedHosts
 
-    # --enable-web switches on human authentication, and human auth refuses to
-    # boot without a recoverable root user or [auth].recovery_token. The MCP
-    # server itself needs neither, so the web UI is opt-in and brings its own
-    # recovery token when asked for.
-    # The recovery token is always supplied. Human auth can be armed by the
-    # --enable-web flag OR by a human user already existing in config, and
-    # without a recovery token the server refuses to boot at all:
+    # Human auth is armed by a human user existing in config. Without
+    # [auth].recovery_token the server exits on every start:
     #   "human authentication is enabled but no recoverable root user exists"
-    # Setting it when it is not needed costs nothing; not setting it is a
-    # crash loop.
+    # Set it regardless; it costs nothing and omitting it is a crash loop.
     $script:RecoveryToken = New-Secret (Join-Path $DataDir '.recovery-token')
-    # Human auth is armed by config -- a human user existing is enough, the
-    # --enable-web flag is not required. Without [auth].recovery_token the
-    # server exits on every start. The error names this key exactly, so write
-    # it to config.toml rather than guessing at an environment variable.
     $cfg = Join-Path $DataDir 'config.toml'
     [void](Set-TomlKey -Path $cfg -Section 'auth' -Key 'recovery_token' -Value $script:RecoveryToken)
     # required for native aim_ credentials
@@ -636,7 +639,6 @@ function Step4-Service {
     [void](Set-TomlKey -Path $cfg -Section 'auth' -Key 'bearer_token' -Value $root)
     Ok 'config.toml: [auth] recovery_token, token_pepper, bearer_token set'
     $webEnv = "`n  <env name=`"AI_MEMORY_AUTH__RECOVERY_TOKEN`" value=`"$($script:RecoveryToken)`"/>"
-    $webArg = if ($EnableWeb) { ' --enable-web' } else { '' }
     # Absolute paths only -- the service runs as LocalSystem and would resolve
     # %LOCALAPPDATA% to a different profile.
     $xmlPath = Join-Path $SvcDir 'ai-memory-service.xml'
@@ -646,7 +648,7 @@ function Step4-Service {
   <name>ai-memory MCP server</name>
   <description>Local long-term memory server for AI coding agents</description>
   <executable>$Exe</executable>
-  <arguments>--data-dir "$DataDir" serve --transport http --bind $($script:BindIp):$Port$webArg</arguments>
+  <arguments>--data-dir "$DataDir" serve --transport http --bind $($script:BindIp):$Port</arguments>
   <startmode>Automatic</startmode>
   <onfailure action="restart" delay="5 sec"/>
   <onfailure action="restart" delay="10 sec"/>
@@ -699,14 +701,45 @@ function Step4-Service {
 
     # poll instead of guessing at a sleep duration
     $svc = Wait-ServiceHealthy
-    if (-not $svc) {
-        # one automatic retry: a stale ai-memory.exe squatting on the port is by
-        # far the most common cause and it is trivially recoverable
-        Warn 'service did not come up; clearing stale processes and retrying once'
-        Get-Process 'ai-memory' -ErrorAction SilentlyContinue | ForEach-Object {
-            Say "  stopping stale ai-memory.exe (pid $($_.Id))"
-            try { Stop-Process -Id $_.Id -Force -ErrorAction Stop } catch { }
-        }
+
+    # Self-heal. Every remedy below corresponds to a refusal this server has
+    # actually produced; read the error, apply the matching fix, start again.
+    $remedies = @(
+        @{ name = 'clear stale ai-memory processes holding the port'
+           when = { param($log) $true }
+           fix  = {
+               Get-Process 'ai-memory' -ErrorAction SilentlyContinue | ForEach-Object {
+                   Say "    stopping stale ai-memory.exe (pid $($_.Id))"
+                   try { Stop-Process -Id $_.Id -Force -ErrorAction Stop } catch { }
+               }
+               Wait-PortFree
+           } },
+        @{ name = 'disable human login (it cannot serve off loopback over plain HTTP)'
+           when = { param($log) $log -match 'refusing human authentication|human authentication is enabled' }
+           fix  = {
+               [void](Set-TomlKey -Path $cfg -Section 'auth' -Key 'recovery_token' -Value $script:RecoveryToken)
+               Disable-HumanLogin
+           } },
+        @{ name = 'narrow the Host allowlist from * to an explicit list'
+           when = { param($log) $log -match 'allow|host' }
+           fix  = {
+               # if '*' is not an accepted value, fall back to naming everything
+               $script:AllowedHosts = @('localhost', '127.0.0.1', '::1', $script:LanIp,
+                   "$WgSubnet.1", $env:COMPUTERNAME) -join ','
+               $newXml = (Get-Content $xmlPath -Raw) -replace
+                   '(<env name="AI_MEMORY_ALLOWED_HOSTS" value=")[^"]*(")', "`${1}$($script:AllowedHosts)`${2}"
+               Set-Content $xmlPath -Value $newXml -Encoding UTF8
+               Say "    allowed hosts -> $($script:AllowedHosts)"
+           } }
+    )
+
+    foreach ($r in $remedies) {
+        if ($svc) { break }
+        $log = Read-ErrLog
+        if (-not (& $r.when $log)) { continue }
+        Warn "service is not serving; trying: $($r.name)"
+        & $r.fix
+        Native { & $winsw stop }  | Out-Null
         Wait-PortFree
         Native { & $winsw start } | Out-Null
         $svc = Wait-ServiceHealthy
@@ -739,32 +772,21 @@ function Step4-Service {
         Ok 'reusing existing API keys'
     }
     else {
-        # a human user is what arms human auth, which cannot run on a
-        # non-loopback plain-HTTP bind. Only create one when the web UI is asked for.
-        $u = if ($EnableWeb) {
+        # api-key add needs the user row to exist. Prefer a non-human user;
+        # creating a HUMAN user is what arms human authentication, and the
+        # server refuses to serve that on a non-loopback plain-HTTP bind.
+        Aim @('user', 'add', '--username', $UserName) -EnvVars @{ AI_MEMORY_AUTH_TOKEN = $root } -AllowFail | Out-Null
+        if ($script:NativeExit -ne 0) {
+            # older builds only expose add-human; create it, then immediately
+            # disable its login so human auth stays off
             Aim @('user', 'add-human', '--username', $UserName, '--email', "$UserName@local", '--name', $UserName) `
-                -EnvVars @{ AI_MEMORY_AUTH_TOKEN = $root } -AllowFail
-        }
-        else {
-            Aim @('user', 'add', '--username', $UserName) -EnvVars @{ AI_MEMORY_AUTH_TOKEN = $root } -AllowFail
-            if ($script:NativeExit -ne 0) {
-                # older builds only expose add-human; fall back to it
-                Aim @('user', 'add-human', '--username', $UserName, '--email', "$UserName@local", '--name', $UserName) `
-                    -EnvVars @{ AI_MEMORY_AUTH_TOKEN = $root } -AllowFail
-            }
-        }
-        if ($u -match 'password') {
-            # the raw output carries ai-memory's stderr banner and PowerShell's
-            # NativeCommandError decoration; keep only the credential
-            $pw = ($u -split "`n" |
-                Where-Object { $_.Trim() -match '^[A-Za-z0-9+/_=-]{16,}$' } |
-                Select-Object -Last 1)
-            if ($pw) { Note "Web UI login -- user '$UserName', temporary password: $($pw.Trim())`n     Change it on first login at http://127.0.0.1:$Port" }
-            else { Note "Web UI user '$UserName' created; its temporary password is in $LogFile" }
+                -EnvVars @{ AI_MEMORY_AUTH_TOKEN = $root } -AllowFail | Out-Null
+            Aim @('user', 'disable', $UserName, '--yes') `
+                -EnvVars @{ AI_MEMORY_AUTH_TOKEN = $root } -AllowFail | Out-Null
         }
 
         $keys = @{}
-        foreach ($label in @('lap-a', 'lap-b')) {
+        foreach ($label in $KeyLabels) {
             $o = Aim @('api-key', 'add', '--username', $UserName, '--label', $label) -EnvVars @{ AI_MEMORY_AUTH_TOKEN = $root }
             $k = ($o -split "`n" | Where-Object { $_.Trim() -match '^aim_' } | Select-Object -First 1)
             if (-not $k) { Die "could not parse an aim_ key for $label. Raw output:`n$o" }
@@ -776,11 +798,18 @@ function Step4-Service {
         (Get-Item $keyFile).Attributes = 'Hidden'
     }
 
+    # First label is this machine's own key; second is the one handed to every
+    # other agent. Extra labels in -KeyLabels are created and printed too.
+    $labels = @($script:Keys.PSObject.Properties.Name)
+    if (-not $labels) { Die "no API keys available; delete $keyFile and re-run" }
+    $script:LocalKey  = $script:Keys.($labels[0])
+    $script:ClientKey = $script:Keys.($labels[[Math]::Min(1, $labels.Count - 1)])
+
     # --- this machine's Claude Code -------------------------------------
     Aim @('install-mcp', '--client', 'claude-code', '--apply',
-        '--server-url', "http://127.0.0.1:$Port", '--auth-token', $script:Keys.'lap-a') -AllowFail | Out-Null
+        '--server-url', "http://127.0.0.1:$Port", '--auth-token', $script:LocalKey) -AllowFail | Out-Null
     Aim @('install-hooks', '--agent', 'claude-code', '--apply',
-        '--server-url', "http://127.0.0.1:$Port", '--auth-token', $script:Keys.'lap-a') -AllowFail | Out-Null
+        '--server-url', "http://127.0.0.1:$Port", '--auth-token', $script:LocalKey) -AllowFail | Out-Null
     Ok 'Claude Code on this laptop wired to the local server'
 
     Step4b-Backups
@@ -825,12 +854,8 @@ function Step4b-Backups {
 # Human login is incompatible with a non-loopback plain-HTTP bind: the server
 # refuses to start rather than send session cookies in the clear. Binding wide
 # is the whole point here, and aim_ API keys need no human login, so any human
-# user gets its login disabled. Without -EnableWeb nothing needs it.
+# user gets its login disabled. Nothing here needs a password.
 function Disable-HumanLogin {
-    if ($EnableWeb) {
-        Warn '-EnableWeb with a non-loopback bind needs an HTTPS reverse proxy; the server will refuse to start'
-        return
-    }
     $out = Aim @('user', 'list') -EnvVars @{ AI_MEMORY_AUTH_TOKEN = $script:RootToken } -AllowFail
     if ($script:NativeExit -ne 0) { return }
 
@@ -854,7 +879,7 @@ function Step5-Test {
     Head 5 'End-to-end tests'
 
     $local = "http://127.0.0.1:$Port"
-    $tok   = $script:Keys.'lap-b'
+    $tok   = $script:ClientKey
 
     Check 'service is Running' { (Get-Service 'ai-memory').Status -eq 'Running' }
 
@@ -946,8 +971,11 @@ function Write-Secrets {
     A ("=" * 70)
     A ""
     A "  root (admin, backups)   $($script:RootToken)"
-    A "  lap-a  (this laptop)    $($script:Keys.'lap-a')"
-    A "  lap-b  (other laptop)   $($script:Keys.'lap-b')"
+    foreach ($k in $script:Keys.PSObject.Properties) {
+        A ("  {0,-22}  {1}" -f $k.Name, $k.Value)
+    }
+    A ""
+    A "  another agent:  ai-memory api-key add --username $UserName --label <name>"
     A ""
     A "  revoke one:  ai-memory api-key revoke <id>"
     A "  list:        ai-memory api-key list"
@@ -960,13 +988,13 @@ function Write-Secrets {
     A '    "mcpServers": {'
     A '      "ai-memory": {'
     A "        `"url`": `"$url`","
-    A ('        "headers": { "Authorization": "Bearer ' + $script:Keys.'lap-b' + '" }')
+    A ('        "headers": { "Authorization": "Bearer ' + $script:ClientKey + '" }')
     A '      }'
     A '    }'
     A '  }'
     A ""
-    A "  or:  ai-memory install-mcp   --client claude-code --apply --server-url http://$($script:McpHost):$Port --auth-token $($script:Keys.'lap-b')"
-    A "       ai-memory install-hooks --agent  claude-code --apply --server-url http://$($script:McpHost):$Port --auth-token $($script:Keys.'lap-b')"
+    A "  or:  ai-memory install-mcp   --client claude-code --apply --server-url http://$($script:McpHost):$Port --auth-token $($script:ClientKey)"
+    A "       ai-memory install-hooks --agent  claude-code --apply --server-url http://$($script:McpHost):$Port --auth-token $($script:ClientKey)"
     A ""
 
     if ($Reach -eq 'Wireguard' -and (Test-Path $cliConf)) {
@@ -995,7 +1023,6 @@ function Write-Secrets {
     A "  data       $DataDir"
     A "  backups    $($script:BackupDest)"
     A "  repo       $RepoRoot"
-    if ($EnableWeb) { A "  web UI     http://127.0.0.1:$Port" }
     if ($script:RecoveryToken) { A "  recovery   $($script:RecoveryToken)" }
     A ""
 
@@ -1031,15 +1058,15 @@ function Step6-Report {
     Say '    "mcpServers": {'
     Say '      "ai-memory": {'
     Say "        `"url`": `"$url`","
-    Say ('        "headers": { "Authorization": "Bearer ' + $script:Keys.'lap-b' + '" }')
+    Say ('        "headers": { "Authorization": "Bearer ' + $script:ClientKey + '" }')
     Say '      }'
     Say '    }'
     Say '  }'
     Say ""
     Say '  Or let ai-memory write that file for you, on Lap B:'
     Say ""
-    Say "    ai-memory install-mcp   --client claude-code --apply --server-url http://$($script:McpHost):$Port --auth-token $($script:Keys.'lap-b')"
-    Say "    ai-memory install-hooks --agent  claude-code --apply --server-url http://$($script:McpHost):$Port --auth-token $($script:Keys.'lap-b')"
+    Say "    ai-memory install-mcp   --client claude-code --apply --server-url http://$($script:McpHost):$Port --auth-token $($script:ClientKey)"
+    Say "    ai-memory install-hooks --agent  claude-code --apply --server-url http://$($script:McpHost):$Port --auth-token $($script:ClientKey)"
     Say ""
 
     Write-Host "  ---------------- WHAT YOU STILL DO ----------------" -ForegroundColor Cyan
@@ -1086,7 +1113,6 @@ function Step6-Report {
 
     Write-Host "  ---------------- REFERENCE ----------------" -ForegroundColor Cyan
     Say ""
-    if ($EnableWeb) { Say "    Web UI          http://127.0.0.1:$Port" }
     Say "    Data            $DataDir"
     Say "    Backups         $($script:BackupDest)   (daily 02:00, keep $KeepBackups)"
     Say "    Service         Get-Service ai-memory   /   Restart-Service ai-memory"

@@ -273,8 +273,18 @@ T 'Wait-PortFree does not leak a boolean into the transcript' {
 T 'the log directory is created before WinSW needs it' {
     (Get-Content $src -Raw) -match "New-Item -ItemType Directory -Force \(Join-Path \`$DataDir 'logs'\)"
 }
-T 'a failed start retries once after clearing stale processes' {
-    (Get-Content $src -Raw) -match 'clearing stale processes and retrying once'
+T 'a failed start works through a remedy list instead of giving up' {
+    $code = Get-Content $src -Raw
+    ($code -match '\$remedies = @\(') -and ($code -match 'foreach \(\$r in \$remedies\)') -and
+    ($code -match 'function Read-ErrLog')
+}
+T 'every remedy has a name, a trigger and a fix' {
+    $code = Get-Content $src -Raw
+    $block = [regex]::Match($code, '\$remedies = @\([\s\S]*?\n    \)\n').Value
+    $n = ([regex]::Matches($block, '(?m)^\s*@\{ name =')).Count
+    ($n -ge 3) -and
+    (([regex]::Matches($block, '(?m)^\s*when =')).Count -eq $n) -and
+    (([regex]::Matches($block, '(?m)^\s*fix  =')).Count -eq $n)
 }
 T 'a failed start runs the server directly to find out why' {
     $code = Get-Content $src -Raw
@@ -313,21 +323,43 @@ T 'doctor.ps1 only reads -- it installs and changes nothing' {
 }
 
 # --- 14. the crash loop ---------------------------------------------------
-T '--enable-web is not passed by default' {
+T 'the web UI is gone entirely -- no flag, no code path' {
     $code = Get-Content $src -Raw
-    # it arms human auth, which refuses to boot without a recovery token:
-    # "human authentication is enabled but no recoverable root user exists"
-    ($code -notmatch 'bind \$\(\$script:BindIp\):\$Port --enable-web') -and ($code -match '\$webArg')
+    # the server refuses human auth on a non-loopback plain-HTTP bind, and
+    # binding wide is the whole point
+    ($code -notmatch 'enable-web') -and ($code -notmatch 'EnableWeb')
 }
-T 'the recovery token is supplied unconditionally, not only with -EnableWeb' {
+T 'the recovery token is always written to config.toml' {
     $code = Get-Content $src -Raw
-    # human auth can be armed by an existing human user, not just the flag
-    ($code -match 'AI_MEMORY_AUTH__RECOVERY_TOKEN') -and ($code -match '\.recovery-token') -and
-    ($code -match 'Setting it when it is not needed costs nothing')
+    ($code -match '\.recovery-token') -and
+    ($code -match "Set-TomlKey -Path \`$cfg -Section 'auth' -Key 'recovery_token'")
 }
-T 'doctor runs the server without --enable-web' {
-    $d = Get-Content (Join-Path $PSScriptRoot 'doctor.ps1') -Raw
-    $d -notmatch 'bind 0\.0\.0\.0:\$Port --enable-web'
+T 'doctor never passes --enable-web either' {
+    (Get-Content (Join-Path $PSScriptRoot 'doctor.ps1') -Raw) -notmatch 'enable-web'
+}
+T 'the Host allowlist defaults to open' {
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($src, [ref]$null, [ref]$null)
+    $p = $ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'AllowedHosts' }
+    $p.DefaultValue.Extent.Text -eq "'*'"
+}
+T 'the firewall accepts any source address' {
+    $code = Get-Content $src -Raw
+    # asked for explicitly: multiple agents from multiple IPs
+    ([regex]::Matches($code, "Set-Fw 'ai-memory MCP' 'TCP' \`$Port 'Any'")).Count -ge 2
+}
+T 'API key labels are a parameter, not two hardcoded laptops' {
+    $code = Get-Content $src -Raw
+    ($code -match 'foreach \(\$label in \$KeyLabels\)') -and
+    ($code -match '\$script:LocalKey') -and ($code -match '\$script:ClientKey')
+}
+T 'LocalKey and ClientKey are actually assigned, not just referenced' {
+    $code = Get-Content $src -Raw
+    # they were used in the output before this assertion existed, which would
+    # have printed an empty bearer token
+    ($code -match '\$script:LocalKey\s+=') -and ($code -match '\$script:ClientKey\s+=')
+}
+T 'the recovery sheet lists every key, not a fixed pair' {
+    (Get-Content $src -Raw) -match '\$script:Keys\.PSObject\.Properties'
 }
 T 'doctor recognises the human-auth crash signature' {
     (Get-Content (Join-Path $PSScriptRoot 'doctor.ps1') -Raw) -match 'no recoverable root user'
@@ -405,10 +437,13 @@ T 'human login is disabled before the service starts' {
     ($code -match "user', 'disable'") -and
     ($code -match 'Disable-HumanLogin\s*\n\s*\$existing')
 }
-T 'a human user is only created when -EnableWeb is asked for' {
+T 'no human user is ever created without its login being disabled' {
     $code = Get-Content $src -Raw
-    $m = [regex]::Match($code, "add-human[\s\S]{0,400}")
-    ($code -match '\$u = if \(\$EnableWeb\)')
+    # api-key add needs a user row, so a non-human user is preferred; if only
+    # add-human exists, the very next call must disable that login
+    $m = [regex]::Match($code, "add-human[\s\S]{0,600}")
+    ($code -match "Aim @\('user', 'add', '--username'") -and
+    ($m.Value -match "'user', 'disable'")
 }
 T 'token_pepper is written -- aim_ keys do not work without it' {
     (Get-Content $src -Raw) -match "Key 'token_pepper'"

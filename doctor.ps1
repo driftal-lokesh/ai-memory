@@ -69,8 +69,7 @@ if (Test-Path $errLog) {
     $txt = Get-Content $errLog -Raw
     if ($txt -match 'human authentication is enabled but no recoverable root user') {
         Write-Host "  MATCH: human auth is armed and [auth].recovery_token is missing." -ForegroundColor Red
-        Detail "       Armed by a human user existing in config -- NOT by --enable-web,"
-        Detail "       so dropping that flag does not help."
+        Detail "       Armed by a human user existing in config."
         Detail "       Fix: re-run setup.ps1; it writes [auth].recovery_token to config.toml."
     }
     if ($txt -match 'single-instance serve lock') {
@@ -84,6 +83,7 @@ if (Test-Path $errLog) {
         Detail "       Human login sends session cookies, which the server will not do"
         Detail "       over plain HTTP off loopback. Binding wide is the point here."
         Detail "       Fix: ai-memory user disable <name> --yes   (setup does this now)"
+        Detail "       There is no web UI in this setup, so nothing needs a password."
     }
     if ($txt -match 'token_pepper') {
         Write-Host "  MATCH: [auth].token_pepper is missing -- aim_ API keys need it." -ForegroundColor Red
@@ -144,8 +144,6 @@ else {
     $o = Join-Path $env:TEMP 'aim-doc-out.txt'
     $e = Join-Path $env:TEMP 'aim-doc-err.txt'
     Remove-Item $o, $e -ErrorAction SilentlyContinue
-    # deliberately without --enable-web: that flag arms human auth, which
-    # refuses to boot without a recovery token and is the usual crash cause
     $a = "--data-dir `"$DataDir`" serve --transport http --bind 0.0.0.0:$Port"
     Detail "$exe $a"
     Write-Host ""
