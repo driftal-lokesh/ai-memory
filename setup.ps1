@@ -29,11 +29,20 @@ param(
     [int]    $WgPort       = 51820,
     [string] $WgSubnet     = '10.8.0',
     [int]    $KeepBackups  = 14,
-    [string] $UserName     = $env:USERNAME
+    [string] $UserName     = $env:USERNAME,
+    [switch] $NoPause
 )
 
 $ErrorActionPreference = 'Stop'
+# pip and winget write progress to stderr. On PowerShell 7.4+ that alone turns a
+# perfectly successful native command into a terminating error. Turn it off and
+# check $LASTEXITCODE ourselves instead.
+$PSNativeCommandUseErrorActionPreference = $false
 $RepoRoot = $PSScriptRoot
+
+# Log everything from the first line. If this window dies, the log survives.
+$LogFile = Join-Path $env:TEMP ("ai-memory-setup-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+try { Start-Transcript -Path $LogFile -Force | Out-Null } catch { }
 $Exe      = Join-Path $DataDir 'ai-memory.exe'
 $SvcDir   = Join-Path $DataDir 'service'
 $script:Checks = [System.Collections.ArrayList]::new()
@@ -67,6 +76,28 @@ function Refresh-Path {
 }
 
 function Have ($cmd) { [bool](Get-Command $cmd -ErrorAction SilentlyContinue) }
+
+# Returns a usable python.exe, or $null. Skips the Microsoft Store alias in
+# WindowsApps (a 0-byte stub that launches the Store instead of running python)
+# and falls back to the py launcher and the known winget install locations.
+function Resolve-Python {
+    foreach ($c in @(Get-Command python -All -ErrorAction SilentlyContinue)) {
+        if ($c.Source -and $c.Source -notmatch 'WindowsApps' -and (Get-Item $c.Source).Length -gt 0) {
+            return $c.Source
+        }
+    }
+    $py = Get-Command py -ErrorAction SilentlyContinue
+    if ($py) {
+        $p = (& $py.Source -3 -c "import sys; print(sys.executable)" 2>$null | Select-Object -Last 1)
+        if ($p -and (Test-Path $p)) { return $p.Trim() }
+    }
+    foreach ($g in @("$env:LOCALAPPDATA\Programs\Python\Python3*\python.exe",
+                     "$env:ProgramFiles\Python3*\python.exe")) {
+        $hit = Get-ChildItem $g -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
+        if ($hit) { return $hit.FullName }
+    }
+    return $null
+}
 
 # Invoke-WebRequest raises WebException on PowerShell 5.1 and
 # HttpResponseException on 7, and the status code hangs off a different property
@@ -133,14 +164,28 @@ function Step0-Prereqs {
     }
 
     Refresh-Path
-    foreach ($c in @('git', 'python')) {
-        if (-not (Have $c)) { Die "$c still not on PATH after install. Open a NEW admin PowerShell and re-run." }
-    }
+    if (-not (Have 'git')) { Die 'git still not on PATH. Close this window, open a NEW admin PowerShell, re-run.' }
 
-    Info 'python dependencies'
-    python -m pip install --quiet --upgrade pip | Out-Null
-    python -m pip install --quiet -r (Join-Path $RepoRoot 'requirements.txt')
-    Ok 'cryptography installed'
+    $script:Python = Resolve-Python
+    if (-not $script:Python) {
+        Die @'
+python was installed but is not usable yet in this window.
+Close this window, open a NEW PowerShell as Administrator, and re-run setup.ps1.
+(Windows does not expose a freshly installed python to an already-open shell.)
+'@
+    }
+    Ok "python -> $($script:Python)"
+
+    Info 'installing cryptography'
+    # No pip self-upgrade: on Windows pip cannot replace its own running exe.
+    # 2>&1 keeps pip's stderr progress out of PowerShell's error stream.
+    $req = Join-Path $RepoRoot 'requirements.txt'
+    $out = & $script:Python -m pip install --disable-pip-version-check --no-input -r $req 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) { Die "pip failed (exit $LASTEXITCODE):`n$out" }
+
+    & $script:Python -c "import cryptography" 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { Die "cryptography installed but will not import:`n$out" }
+    Ok 'cryptography installed and imports'
 }
 
 # ------------------------------------------------------------------ step 1
@@ -454,7 +499,7 @@ function Step4b-Backups {
     [Environment]::SetEnvironmentVariable('AI_MEMORY_DATA_DIR', $DataDir, 'User')
     [Environment]::SetEnvironmentVariable('AI_MEMORY_EXE', $Exe, 'User')
 
-    $py = (Get-Command python).Source
+    $py = $script:Python
     $script = Join-Path $RepoRoot 'memory_backup.py'
     $action  = New-ScheduledTaskAction -Execute $py `
         -Argument "`"$script`" --keep $KeepBackups backup" -WorkingDirectory $RepoRoot
@@ -508,15 +553,15 @@ function Step5-Test {
 
     Check 'crypto self-check passes' {
         Push-Location $RepoRoot
-        try { python test_backup.py | Out-Null; $LASTEXITCODE -eq 0 } finally { Pop-Location }
+        try { & $script:Python test_backup.py | Out-Null; $LASTEXITCODE -eq 0 } finally { Pop-Location }
     }
 
     Check 'a real backup encrypts and restores' {
         Push-Location $RepoRoot
         try {
-            python memory_backup.py --dest "$($script:BackupDest)" --keep $KeepBackups backup | Out-Null
+            & $script:Python memory_backup.py --dest "$($script:BackupDest)" --keep $KeepBackups backup | Out-Null
             if ($LASTEXITCODE -ne 0) { return $false }
-            python memory_backup.py --dest "$($script:BackupDest)" verify | Out-Null
+            & $script:Python memory_backup.py --dest "$($script:BackupDest)" verify | Out-Null
             $LASTEXITCODE -eq 0
         }
         finally { Pop-Location }
@@ -619,8 +664,24 @@ try {
 }
 catch {
     Write-Host ""
-    Write-Host "SETUP STOPPED: $($_.Exception.Message)" -ForegroundColor Red
-    Write-Host "Nothing is half-installed that a re-run won't fix -- every step is idempotent." -ForegroundColor Gray
-    Write-Host "Logs: $DataDir\logs" -ForegroundColor Gray
-    exit 1
+    Write-Host "SETUP STOPPED" -ForegroundColor Red
+    Write-Host "  $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host ""
+    Write-Host "  at $($_.InvocationInfo.ScriptName):$($_.InvocationInfo.ScriptLineNumber)" -ForegroundColor Gray
+    Write-Host "  $($_.InvocationInfo.Line.Trim())" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "  Every step is idempotent -- fix the cause and re-run." -ForegroundColor Gray
+    Write-Host "  Full log:    $LogFile" -ForegroundColor Yellow
+    Write-Host "  Server log:  $DataDir\logs" -ForegroundColor Gray
+    $script:Failed = $true
+}
+finally {
+    try { Stop-Transcript | Out-Null } catch { }
+    Write-Host ""
+    Write-Host "  Log saved to $LogFile" -ForegroundColor Gray
+    if ($Host.Name -eq 'ConsoleHost' -and -not $NoPause) {
+        Write-Host ""
+        Read-Host '  Press Enter to close'
+    }
+    if ($script:Failed) { exit 1 }
 }

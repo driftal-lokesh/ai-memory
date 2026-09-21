@@ -109,7 +109,34 @@ T 'Find-DriveRoot returns null when no Google Drive is mounted' {
 T 'Have detects a present command' { Have 'Get-Command' }
 T 'Have rejects a missing command' { -not (Have 'definitely-not-a-real-command-xyz') }
 
-# --- 7. MCP URL always carries the mandatory /mcp suffix -----------------
+# --- 7. the crash fixes ---------------------------------------------------
+T 'Resolve-Python never returns a WindowsApps Store stub' {
+    $p = Resolve-Python
+    # on this host it may legitimately be $null; what must never happen is
+    # returning the 0-byte Store alias that opens the Microsoft Store
+    ($null -eq $p) -or ($p -notmatch 'WindowsApps')
+}
+T 'setup.ps1 no longer self-upgrades pip' {
+    (Get-Content $src -Raw) -notmatch '--upgrade\s+pip'
+}
+T 'every python invocation uses the resolved interpreter' {
+    $txt = Get-Content $src -Raw
+    # a bare `python ` call would fall back to PATH and can hit the Store stub
+    $bare = [regex]::Matches($txt, '(?m)^\s+python\s+[-\w]') | ForEach-Object { $_.Value }
+    $bare.Count -eq 0
+}
+T 'native stderr cannot become a terminating error' {
+    (Get-Content $src -Raw) -match '\$PSNativeCommandUseErrorActionPreference\s*=\s*\$false'
+}
+T 'the window is kept open on failure' {
+    $txt = Get-Content $src -Raw
+    ($txt -match 'Start-Transcript') -and ($txt -match 'Read-Host') -and ($txt -match 'Stop-Transcript')
+}
+T 'the elevated relaunch passes -NoExit' {
+    (Get-Content (Join-Path $PSScriptRoot 'bootstrap.ps1') -Raw) -match "'-NoExit'"
+}
+
+# --- 8. MCP URL always carries the mandatory /mcp suffix -----------------
 T 'every printed MCP url ends in /mcp' {
     $txt = Get-Content $src -Raw
     $urls = [regex]::Matches($txt, 'http://\$\([^)]+\):\$Port(/mcp)?') | ForEach-Object { $_.Value }

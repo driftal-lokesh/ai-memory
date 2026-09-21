@@ -17,6 +17,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$PSNativeCommandUseErrorActionPreference = $false
 
 # --- elevate ---------------------------------------------------------------
 $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -25,16 +26,17 @@ if (-not ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal
     $self = Join-Path $env:TEMP 'ai-memory-bootstrap.ps1'
     $MyInvocation.MyCommand.ScriptBlock.ToString() | Set-Content $self -Encoding UTF8
     Start-Process powershell -Verb RunAs -ArgumentList @(
-        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $self,
+        '-NoExit', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $self,
         '-RepoUrl', $RepoUrl, '-Dest', $Dest, '-Reach', $Reach
     )
+    Write-Host "An Administrator window has opened. Continue there." -ForegroundColor Cyan
     return
 }
 
 # --- git -------------------------------------------------------------------
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
     Write-Host "Installing Git..." -ForegroundColor Gray
-    winget install --id Git.Git --silent --accept-package-agreements --accept-source-agreements | Out-Null
+    winget install --id Git.Git --silent --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
     $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
                 [Environment]::GetEnvironmentVariable('Path', 'User')
 }
@@ -50,4 +52,6 @@ else {
 }
 
 # --- run -------------------------------------------------------------------
-& (Join-Path $Dest 'setup.ps1') -Reach $Reach
+$setup = Join-Path $Dest 'setup.ps1'
+if (-not (Test-Path $setup)) { throw "clone succeeded but $setup is missing" }
+& $setup -Reach $Reach
