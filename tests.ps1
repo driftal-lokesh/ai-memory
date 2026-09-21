@@ -136,7 +136,62 @@ T 'the elevated relaunch passes -NoExit' {
     (Get-Content (Join-Path $PSScriptRoot 'bootstrap.ps1') -Raw) -match "'-NoExit'"
 }
 
-# --- 8. MCP URL always carries the mandatory /mcp suffix -----------------
+# --- 8. the Native wrapper, against the real failure mode ----------------
+# ai-memory logs its banner to stderr and exits 0. On PS 5.1 that combination
+# plus ErrorActionPreference='Stop' is a terminating error. Reproduce it.
+$noisy = if ($IsWindows -eq $false) { { /bin/sh -c 'echo banner-on-stderr >&2; exit 0' } }
+         else { { cmd /c 'echo banner-on-stderr 1>&2& exit 0' } }
+
+T 'the unguarded form is what broke (or is at least not relied on)' {
+    $ErrorActionPreference = 'Stop'
+    $threw = $false
+    try { $null = & $noisy 2>&1 | Out-String } catch { $threw = $true }
+    # On 7.x this may not throw; on 5.1 it does. Either way the wrapper below
+    # must survive, which is the assertion that matters.
+    $true
+}
+
+T 'Native survives a command that writes to stderr and exits 0' {
+    $ErrorActionPreference = 'Stop'
+    $out = Native $noisy
+    ($script:NativeExit -eq 0) -and ($out -match 'banner-on-stderr')
+}
+
+T 'Native reports a real non-zero exit code' {
+    $ErrorActionPreference = 'Stop'
+    $bad = if ($IsWindows -eq $false) { { /bin/sh -c 'exit 3' } } else { { cmd /c 'exit 3' } }
+    $null = Native $bad
+    $script:NativeExit -eq 3
+}
+
+T 'Native restores ErrorActionPreference afterwards' {
+    $ErrorActionPreference = 'Stop'
+    $null = Native $noisy
+    $ErrorActionPreference -eq 'Stop'
+}
+
+T 'Native restores the 7.x native-error preference afterwards' {
+    if ($null -eq (Get-Variable PSNativeCommandUseErrorActionPreference -Scope Global -ErrorAction SilentlyContinue)) {
+        return $true   # 5.1: the variable does not exist, nothing to restore
+    }
+    $global:PSNativeCommandUseErrorActionPreference = $true
+    $null = Native $noisy
+    $global:PSNativeCommandUseErrorActionPreference -eq $true
+}
+
+T 'no native call in setup.ps1 redirects stderr outside Native' {
+    $code = (Get-Content $src) | Where-Object { $_.TrimStart() -notmatch '^#' }
+    $bad = $code | Where-Object { $_ -match '2>&1' -and $_ -notmatch '\$Block' }
+    $bad.Count -eq 0
+}
+
+T 'exit codes are read from NativeExit, not the stale LASTEXITCODE' {
+    $code = Get-Content $src -Raw
+    # $LASTEXITCODE survives only inside Native itself
+    ([regex]::Matches($code, '\$LASTEXITCODE')).Count -le 2
+}
+
+# --- 9. MCP URL always carries the mandatory /mcp suffix -----------------
 T 'every printed MCP url ends in /mcp' {
     $txt = Get-Content $src -Raw
     $urls = [regex]::Matches($txt, 'http://\$\([^)]+\):\$Port(/mcp)?') | ForEach-Object { $_.Value }

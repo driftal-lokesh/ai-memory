@@ -17,7 +17,26 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$PSNativeCommandUseErrorActionPreference = $false
+
+# git and winget both log progress to stderr. On PowerShell 5.1 a redirected
+# native stderr line becomes an ErrorRecord, and ErrorActionPreference='Stop'
+# makes emitting one terminating -- even when the command succeeded. On 7.3+ the
+# equivalent trap is $PSNativeCommandUseErrorActionPreference. Disarm both.
+if (Get-Variable PSNativeCommandUseErrorActionPreference -Scope Global -ErrorAction SilentlyContinue) {
+    $global:PSNativeCommandUseErrorActionPreference = $false
+}
+function Native {
+    param([Parameter(Mandatory)] [scriptblock] $Block)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $global:LASTEXITCODE = 0
+        $out = & $Block 2>&1 | Out-String
+        $script:NativeExit = $global:LASTEXITCODE
+        return $out
+    }
+    finally { $ErrorActionPreference = $prev }
+}
 
 # --- elevate ---------------------------------------------------------------
 $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -36,7 +55,10 @@ if (-not ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal
 # --- git -------------------------------------------------------------------
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
     Write-Host "Installing Git..." -ForegroundColor Gray
-    winget install --id Git.Git --silent --accept-package-agreements --accept-source-agreements 2>&1 | Out-Null
+    $wg = Native { winget install --id Git.Git --silent --accept-package-agreements --accept-source-agreements }
+    if ($script:NativeExit -ne 0 -and $wg -notmatch 'already installed|No newer package') {
+        Write-Host $wg.Trim() -ForegroundColor Yellow
+    }
     $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
                 [Environment]::GetEnvironmentVariable('Path', 'User')
 }
@@ -44,11 +66,13 @@ if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
 # --- clone / update --------------------------------------------------------
 if (Test-Path (Join-Path $Dest '.git')) {
     Write-Host "Updating $Dest" -ForegroundColor Gray
-    git -C $Dest pull --ff-only
+    $out = Native { git -C $Dest pull --ff-only }
+    if ($script:NativeExit -ne 0) { throw "git pull failed:`n$out" }
 }
 else {
     Write-Host "Cloning into $Dest" -ForegroundColor Gray
-    git clone --depth 1 $RepoUrl $Dest
+    $out = Native { git clone --depth 1 $RepoUrl $Dest }
+    if ($script:NativeExit -ne 0) { throw "git clone failed:`n$out" }
 }
 
 # --- run -------------------------------------------------------------------

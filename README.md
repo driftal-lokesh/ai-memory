@@ -51,6 +51,9 @@ Already cloned? Just:
 
 Every step is idempotent. Re-running is safe and repairs a partial install.
 
+Works on PowerShell 5.1 (the Windows default) and 7.x. The two editions trap
+native-command stderr differently, so all native calls go through one wrapper.
+
 ## What it does
 
 | Step | |
@@ -100,7 +103,7 @@ python memory_backup.py verify     # restore newest into a temp dir and assert i
 python memory_backup.py prune      # enforce retention only
 python memory_backup.py restore    # DANGER: overwrites live data. Stop-Service ai-memory first.
 python test_backup.py              # crypto self-check
-pwsh -File tests.ps1               # offline checks for setup.ps1 (17 of them)
+pwsh -File tests.ps1               # offline checks for setup.ps1 (24 of them)
 ```
 
 Retention is enforced by deleting files. There is no incremental backup — if
@@ -126,6 +129,7 @@ Start-Service ai-memory
 | Lap A rebooted, server gone | It shouldn't. `Get-Service ai-memory`. Never start the server from a Scheduled Task — it is silently killed at the next reboot. |
 | `winget` not found | Install "App Installer" from the Microsoft Store |
 | The window vanished | It shouldn't any more, but the full transcript is at `%TEMP%\ai-memory-setup-*.log` |
+| Native command "crashes" the script | Every native call goes through the `Native` wrapper. If you add one, wrap it — see the comment above `function Native` in setup.ps1. |
 | "python is not usable yet in this window" | Windows won't expose a just-installed python to an already-open shell. Close it, open a new admin PowerShell, re-run. |
 
 ## Layout

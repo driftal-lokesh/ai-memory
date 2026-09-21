@@ -88,7 +88,9 @@ function Resolve-Python {
     }
     $py = Get-Command py -ErrorAction SilentlyContinue
     if ($py) {
-        $p = (& $py.Source -3 -c "import sys; print(sys.executable)" 2>$null | Select-Object -Last 1)
+        $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        try { $p = (& $py.Source -3 -c "import sys; print(sys.executable)" 2>$null | Select-Object -Last 1) }
+        finally { $ErrorActionPreference = $prevEap }
         if ($p -and (Test-Path $p)) { return $p.Trim() }
     }
     foreach ($g in @("$env:LOCALAPPDATA\Programs\Python\Python3*\python.exe",
@@ -97,6 +99,38 @@ function Resolve-Python {
         if ($hit) { return $hit.FullName }
     }
     return $null
+}
+
+# Every native command goes through this.
+#
+# Two different traps, one per PowerShell edition, and both fire on commands that
+# SUCCEEDED:
+#   5.1   redirecting native stderr turns those lines into ErrorRecord objects,
+#         and with $ErrorActionPreference='Stop' emitting one is terminating.
+#   7.3+  $PSNativeCommandUseErrorActionPreference makes a non-zero exit throw.
+# ai-memory logs its startup banner to stderr (normal for Rust tracing), so
+# without this wrapper every ai-memory call dies on 5.1.
+#
+# Output comes back as one string; the exit code lands in $script:NativeExit.
+function Native {
+    param([Parameter(Mandatory)] [scriptblock] $Block)
+    $prevEap = $ErrorActionPreference
+    $hasNativePref = $null -ne (Get-Variable PSNativeCommandUseErrorActionPreference -Scope Global -ErrorAction SilentlyContinue)
+    if ($hasNativePref) {
+        $prevNative = $global:PSNativeCommandUseErrorActionPreference
+        $global:PSNativeCommandUseErrorActionPreference = $false
+    }
+    $ErrorActionPreference = 'Continue'
+    try {
+        $global:LASTEXITCODE = 0
+        $out = & $Block 2>&1 | Out-String
+        $script:NativeExit = $global:LASTEXITCODE
+        return $out
+    }
+    finally {
+        $ErrorActionPreference = $prevEap
+        if ($hasNativePref) { $global:PSNativeCommandUseErrorActionPreference = $prevNative }
+    }
 }
 
 # Invoke-WebRequest raises WebException on PowerShell 5.1 and
@@ -110,9 +144,9 @@ function StatusOf ($errorRecord) {
 
 function Winget-Install ($id, $label) {
     Info "$label ($id)"
-    $out = winget install --id $id --silent --accept-package-agreements --accept-source-agreements 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 0 -and $out -notmatch 'already installed|No newer package') {
-        Warn "winget returned $LASTEXITCODE for ${id}:"
+    $out = Native { winget install --id $id --silent --accept-package-agreements --accept-source-agreements }
+    if ($script:NativeExit -ne 0 -and $out -notmatch 'already installed|No newer package') {
+        Warn "winget returned $($script:NativeExit) for ${id}:"
         Say ($out.Trim())
     }
     Refresh-Path
@@ -125,9 +159,9 @@ function Aim {
     $old = @{}
     foreach ($k in $EnvVars.Keys) { $old[$k] = [Environment]::GetEnvironmentVariable($k); Set-Item "env:$k" $EnvVars[$k] }
     try {
-        $out = & $Exe @CliArgs 2>&1 | Out-String
-        if ($LASTEXITCODE -ne 0 -and -not $AllowFail) {
-            Die "ai-memory $($CliArgs -join ' ') exited $LASTEXITCODE`n$out"
+        $out = Native { & $Exe @CliArgs }
+        if ($script:NativeExit -ne 0 -and -not $AllowFail) {
+            Die "ai-memory $($CliArgs -join ' ') exited $($script:NativeExit)`n$out"
         }
         return $out
     }
@@ -178,13 +212,12 @@ Close this window, open a NEW PowerShell as Administrator, and re-run setup.ps1.
 
     Info 'installing cryptography'
     # No pip self-upgrade: on Windows pip cannot replace its own running exe.
-    # 2>&1 keeps pip's stderr progress out of PowerShell's error stream.
     $req = Join-Path $RepoRoot 'requirements.txt'
-    $out = & $script:Python -m pip install --disable-pip-version-check --no-input -r $req 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 0) { Die "pip failed (exit $LASTEXITCODE):`n$out" }
+    $out = Native { & $script:Python -m pip install --disable-pip-version-check --no-input -r $req }
+    if ($script:NativeExit -ne 0) { Die "pip failed (exit $($script:NativeExit)):`n$out" }
 
-    & $script:Python -c "import cryptography" 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) { Die "cryptography installed but will not import:`n$out" }
+    $imp = Native { & $script:Python -c "import cryptography" }
+    if ($script:NativeExit -ne 0) { Die "cryptography installed but will not import:`n$imp" }
     Ok 'cryptography installed and imports'
 }
 
@@ -252,10 +285,17 @@ function Step2-Network {
     }
     else {
         Info 'generating keypairs'
-        $srvKey = (& $wg genkey).Trim()
-        $srvPub = ($srvKey | & $wg pubkey).Trim()
-        $cliKey = (& $wg genkey).Trim()
-        $cliPub = ($cliKey | & $wg pubkey).Trim()
+        $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        try {
+            $srvKey = (& $wg genkey).Trim()
+            $srvPub = ($srvKey | & $wg pubkey).Trim()
+            $cliKey = (& $wg genkey).Trim()
+            $cliPub = ($cliKey | & $wg pubkey).Trim()
+        }
+        finally { $ErrorActionPreference = $prevEap }
+        foreach ($k in @($srvKey, $srvPub, $cliKey, $cliPub)) {
+            if (-not $k -or $k.Length -lt 40) { Die "wg produced an unusable key: '$k'" }
+        }
 
         @"
 [Interface]
@@ -293,7 +333,8 @@ PersistentKeepalive = 25
     if ($svc) { Ok 'WireGuard tunnel service already installed' }
     else {
         Info 'installing tunnel service'
-        & 'C:\Program Files\WireGuard\wireguard.exe' /installtunnelservice $srvConf
+        $wgOut = Native { & 'C:\Program Files\WireGuard\wireguard.exe' /installtunnelservice $srvConf }
+        if ($script:NativeExit -ne 0) { Die "WireGuard tunnel install failed:`n$wgOut" }
         Start-Sleep 3
         Ok 'tunnel service installed'
     }
@@ -427,12 +468,13 @@ function Step4-Service {
 
     if (Get-Service 'ai-memory' -ErrorAction SilentlyContinue) {
         Info 'reinstalling service with current config'
-        & $winsw stop   2>&1 | Out-Null
-        & $winsw uninstall 2>&1 | Out-Null
+        Native { & $winsw stop }      | Out-Null
+        Native { & $winsw uninstall } | Out-Null
         Start-Sleep 2
     }
-    & $winsw install 2>&1 | Out-Null
-    & $winsw start   2>&1 | Out-Null
+    $inst = Native { & $winsw install }
+    if ($script:NativeExit -ne 0) { Die "WinSW install failed:`n$inst" }
+    Native { & $winsw start } | Out-Null
     Start-Sleep 4
     $svc = Get-Service 'ai-memory' -ErrorAction SilentlyContinue
     if (-not $svc -or $svc.Status -ne 'Running') {
@@ -441,8 +483,8 @@ function Step4-Service {
     Ok 'service running (survives reboot)'
 
     # --- never sleep -----------------------------------------------------
-    powercfg /change standby-timeout-ac 0 2>&1 | Out-Null
-    powercfg /change hibernate-timeout-ac 0 2>&1 | Out-Null
+    Native { powercfg /change standby-timeout-ac 0 }   | Out-Null
+    Native { powercfg /change hibernate-timeout-ac 0 } | Out-Null
     Ok 'sleep disabled on AC power'
 
     # --- user + per-machine keys ----------------------------------------
@@ -553,16 +595,17 @@ function Step5-Test {
 
     Check 'crypto self-check passes' {
         Push-Location $RepoRoot
-        try { & $script:Python test_backup.py | Out-Null; $LASTEXITCODE -eq 0 } finally { Pop-Location }
+        try { Native { & $script:Python test_backup.py } | Out-Null; $script:NativeExit -eq 0 } finally { Pop-Location }
     }
 
     Check 'a real backup encrypts and restores' {
         Push-Location $RepoRoot
         try {
-            & $script:Python memory_backup.py --dest "$($script:BackupDest)" --keep $KeepBackups backup | Out-Null
-            if ($LASTEXITCODE -ne 0) { return $false }
-            & $script:Python memory_backup.py --dest "$($script:BackupDest)" verify | Out-Null
-            $LASTEXITCODE -eq 0
+            $b = Native { & $script:Python memory_backup.py --dest "$($script:BackupDest)" --keep $KeepBackups backup }
+            if ($script:NativeExit -ne 0) { Warn "backup output:`n$b"; return $false }
+            $v = Native { & $script:Python memory_backup.py --dest "$($script:BackupDest)" verify }
+            if ($script:NativeExit -ne 0) { Warn "verify output:`n$v" }
+            $script:NativeExit -eq 0
         }
         finally { Pop-Location }
     }
